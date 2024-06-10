@@ -1,5 +1,10 @@
 const std = @import("std");
 
+const FileOpenError = error{
+    InvalidHeader,
+    UnsupportedVersion,
+};
+
 const GPT2Config = struct {
     max_seq_len: u32, // Maximum sequence length eg 1024
     vocab_size: u32, // Vocabulary size eg 50257
@@ -91,11 +96,12 @@ pub fn main() !void {
 
     const model = GPT2.default;
 
-    if (build_gpt2_from_checkpoint(model, "gpt2_124M.bin")) |err| {
-        std.debug.print("Error building GPT-2 model: {}\n", .{err});
+    var tokenizer: Tokenizer = undefined;
+    if (build_tokenizer_from_vocab("gpt2_tokenizer.bin", &tokenizer)) |err| {
+        std.debug.print("Error building tokenizer: {}\n", .{err});
         return;
     } else |_| {
-        std.debug.print("GPT-2 model built successfully\n", .{});
+        std.debug.print("Tokenizer built successfully\n", .{});
     }
 
     // const pos_encodings = load_positional_encodings("gpt2_124M.bin", 1024, 768);
@@ -118,76 +124,85 @@ pub fn main() !void {
 //     return normalized;
 // }
 
-fn build_gpt2_from_checkpoint(model: GPT2, filepath: []const u8) []f32 {
-    var file = std.fs.cwd().openFile(filepath, .{}) catch {
+const Tokenizer = struct { vocabulary_size: u32, init: bool, data: []u8 };
+
+fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
+    const headers = try read_n_from_checkpoint_file(filepath, 256, 0) catch |err| {
+        std.debug.print("Error reading the model file\n", .{});
+        return err;
+    };
+
+    const config = GPT2Config{
+        .max_seq_len = headers[2],
+        .vocab_size = headers[3],
+        .n_layer = headers[4],
+        .n_head = headers[5],
+        .n_channels = headers[6],
+    };
+
+    model.config = config;
+}
+
+fn build_tokenizer_from_vocab(filepath: []const u8, tokenizer: *Tokenizer) !void {
+    const headers = try read_n_from_checkpoint_file(filepath, 256, 0) catch |err| {
+        std.debug.print("Error reading the tokenizer file\n", .{});
+        return err;
+    };
+
+    if (headers[0] != 20240326) {
+        std.debug.print("Bad magic tokenizer file\n", .{});
+        return FileOpenError.InvalidHeader;
+    }
+
+    if (headers[1] != 1) {
+        std.debug.print("Bad version in tokenizer file\n", .{});
+        return FileOpenError.UnsupportedVersion;
+    }
+
+    var file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_only }) catch |err| {
+        std.debug.print("Error opening the tokenizer file\n", .{});
+        return err;
+    };
+
+    defer file.close();
+
+    try file.seek(256 * f32);
+
+    tokenizer.vocab_size = headers[2];
+    tokenizer.data = std.heap.page_allocator.create([]u8, tokenizer.vocab_size * f32) catch unreachable;
+
+    for (tokenizer.vocab_map) |*token| {
+        var token_length: u8 = undefined;
+        try file.readAll(std.mem.asBytes(&token_length));
+        token.* = try std.heap.page_allocator.create([]u8, token_length) catch unreachable;
+        try file.readAll(token.*);
+    }
+
+    std.debug.print("sample token", .{tokenizer.vocab_map[69]});
+
+    tokenizer.init = true;
+}
+
+fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, offset: usize) !std.ArrayList(f32) {
+    var file = std.fs.cwd().openFile(filepath, .{ .mode = .read_only }) catch |err| {
         std.debug.print("Error opening the model file\n", .{});
-        std.posix.exit(1);
+        return err;
+    };
+    defer file.close();
+    // TODO handle file empty error
+
+    try file.seek(offset * f32);
+
+    var data = std.ArrayList(f32).initCapacity(std.heap.page_allocator, N);
+    try std.ArrayList(f32).resize(&data, N);
+
+    const bytes = std.mem.slicesAsBytes(data.items);
+    try file.read(bytes) catch |err| {
+        std.debug.print("Error reading the model file\n", .{});
+        return err;
     };
 
-    const header = std.mem.zeroes(i32);
-    file.readAll(std.mem.bytesAsSlice(u8, header)) catch {
-        std.debug.print("Error opening the model file\n", .{});
-        std.posix.exit(1);
-    };
-
-    std.debug.print("Header: {}", .{header});
-
-    if (header[0] != 20240326) {
-        std.debug.print("Bad magic model file\n", .{});
-        std.posix.exit(1);
-    }
-
-    if (header[1] != 3) {
-        std.debug.print("Bad version in model file\n", .{});
-        std.debug.print("---> HINT: try to re-run `python train_gpt2.py`\n", .{});
-        std.posix.exit(1);
-    }
-
-    model.config.max_seq_len = @intCast(header[2]);
-    model.config.vocab_size = @intCast(header[3]);
-    model.config.n_layer = @intCast(header[4]);
-    model.config.n_head = @intCast(header[5]);
-    model.config.n_channels = @intCast(header[6]);
-    model.config.padded_vocab_size = @intCast(header[7]);
-
-    std.debug.print("[GPT-2]\n", .{});
-    std.debug.print("max_seq_len: {}\n", .{model.config.max_seq_len});
-    std.debug.print("vocab_size: {}\n", .{model.config.vocab_size});
-    std.debug.print("padded_vocab_size: {}\n", .{model.config.padded_vocab_size});
-    std.debug.print("num_layers: {}\n", .{model.config.num_layers});
-    std.debug.print("num_heads: {}\n", .{model.config.num_heads});
-    std.debug.print("channels: {}\n", .{model.config.channels});
-
-    var num_parameters: usize = 0;
-    const param_sizes = std.ArrayList(usize).init(std.heap.page_allocator);
-
-    // TODO fill param_sizes with the sizes of the parameters
-
-    fill_in_param_sizes(file, param_sizes);
-
-    for (param_sizes.items) |size| {
-        num_parameters += size;
-    }
-
-    std.debug.print("num_parameters: {}\n", .{num_parameters});
-
-    model.params_memory = std.heap.page_allocator.create([]f32, num_parameters) catch {
-        std.debug.print("Error allocating memory for the model parameters\n", .{});
-        std.posix.exit(1);
-    };
-
-    file.close();
-
-    model.activations_memory = null;
-    model.gradients_memory = null;
-    model.gradients_activations_memory = null;
-    model.m_memory = null;
-    model.v_memory = null;
-    model.inputs = null;
-    model.targets = null;
-    model.batch_size = 0;
-    model.seq_len = 0;
-    model.mean_loss = -1.0;
+    return data;
 }
 
 fn fill_in_param_sizes(file: std.fs.File, param_sizes: std.ArrayList(usize)) void {
@@ -198,6 +213,7 @@ fn fill_in_param_sizes(file: std.fs.File, param_sizes: std.ArrayList(usize)) voi
     };
     param_sizes.append(@intCast(size));
 }
+
 // fn load_embeddings(filepath: []const u8, vocab_size: usize, embedding_dim: usize) []f32 {
 //     return load_weights(filepath, vocab_size * embedding_dim);
 // }
@@ -206,7 +222,7 @@ fn fill_in_param_sizes(file: std.fs.File, param_sizes: std.ArrayList(usize)) voi
 //     return load_weights(filepath, seq_len * embedding_dim);
 // }
 
-// TODO design basic forward pass implementation
+// TODO: design basic forward pass implementation
 // load weights and embeddings
 // multiheaded attention
 // FFN
