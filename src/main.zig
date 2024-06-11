@@ -3,12 +3,14 @@ const std = @import("std");
 const FileOpenError = error{
     InvalidHeader,
     UnsupportedVersion,
+    FileEmpty,
+    FileTooSmall,
 };
 
 const GPT2Config = struct {
     max_seq_len: u32, // Maximum sequence length eg 1024
     vocab_size: u32, // Vocabulary size eg 50257
-    n_embd: u32, // Embedding dimension eg 768
+    n_embed: u32, // Embedding dimension eg 768
     n_layer: u32, // Number of layers eg 12
     n_head: u32, // Number of attention heads eg 12
     n_channels: u32, // Number of channels in the MLP eg 768
@@ -36,13 +38,13 @@ const GPT2 = struct {
     seq_len: usize = 0,
     mean_loss: f32 = -1.0, // TODO ?
 
-    const default = GPT2{
+    var default = GPT2{
         .config = GPT2Config{
             .max_seq_len = 0,
             .vocab_size = 0,
             .padded_vocab_size = 0,
             .n_layer = 0,
-            .n_embd = 0,
+            .n_embed = 0,
             .n_head = 0,
             .n_channels = 0,
         },
@@ -94,18 +96,21 @@ const GPT2 = struct {
 pub fn main() !void {
     std.debug.print("Hello, world!\n", .{});
 
-    const model = GPT2.default;
-
-    var tokenizer: Tokenizer = undefined;
-    if (build_tokenizer_from_vocab("gpt2_tokenizer.bin", &tokenizer)) |err| {
-        std.debug.print("Error building tokenizer: {}\n", .{err});
+    var model = GPT2.default;
+    build_model_from_file("gpt2_124M.bin", &model) catch |err| {
+        std.debug.print("Error building model: {}\n", .{err});
         return;
-    } else |_| {
-        std.debug.print("Tokenizer built successfully\n", .{});
-    }
+    };
+
+    // var tokenizer: Tokenizer = undefined;
+    // if (build_tokenizer_from_vocab("gpt2_tokenizer.bin", &tokenizer)) |err| {
+    //     std.debug.print("Error building tokenizer: {}\n", .{err});
+    //     return;
+    // } else |_| {
+    //     std.debug.print("Tokenizer built successfully\n", .{});
+    // }
 
     // const pos_encodings = load_positional_encodings("gpt2_124M.bin", 1024, 768);
-
 }
 
 // pub fn gelu(x: f32) f32 {
@@ -127,18 +132,20 @@ pub fn main() !void {
 const Tokenizer = struct { vocabulary_size: u32, init: bool, data: []u8 };
 
 fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
-    const headers = try read_n_from_checkpoint_file(filepath, 256, 0) catch |err| {
-        std.debug.print("Error reading the model file\n", .{});
-        return err;
-    };
+    const t = try read_n_from_checkpoint_file(filepath, 256, u32, 0);
+    const headers = t.items;
 
     const config = GPT2Config{
         .max_seq_len = headers[2],
         .vocab_size = headers[3],
+        .n_embed = 0.0,
         .n_layer = headers[4],
         .n_head = headers[5],
         .n_channels = headers[6],
+        .padded_vocab_size = 0,
     };
+
+    std.debug.print("max_seq_len: {}, vocab_size: {}, n_layer: {}, n_head: {}, n_channels: {}", .{ config.max_seq_len, config.vocab_size, config.n_layer, config.n_head, config.n_channels });
 
     model.config = config;
 }
@@ -166,7 +173,7 @@ fn build_tokenizer_from_vocab(filepath: []const u8, tokenizer: *Tokenizer) !void
 
     defer file.close();
 
-    try file.seek(256 * f32);
+    try file.seekTo(256 * @sizeOf(f32));
 
     tokenizer.vocab_size = headers[2];
     tokenizer.data = std.heap.page_allocator.create([]u8, tokenizer.vocab_size * f32) catch unreachable;
@@ -183,24 +190,26 @@ fn build_tokenizer_from_vocab(filepath: []const u8, tokenizer: *Tokenizer) !void
     tokenizer.init = true;
 }
 
-fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, offset: usize) !std.ArrayList(f32) {
-    var file = std.fs.cwd().openFile(filepath, .{ .mode = .read_only }) catch |err| {
-        std.debug.print("Error opening the model file\n", .{});
-        return err;
-    };
+// need both f32 and u32 handling for GPT2Config vs parameters
+fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, comptime T: type, offset: usize) !std.ArrayList(f32) {
+    var file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_only });
     defer file.close();
-    // TODO handle file empty error
 
-    try file.seek(offset * f32);
+    const file_size = try file.getEndPos();
+    if (file_size < N * @sizeOf(T)) {
+        return error.FileTooSmall;
+    }
+    if (file_size == 0) {
+        return error.FileEmpty;
+    }
 
-    var data = std.ArrayList(f32).initCapacity(std.heap.page_allocator, N);
-    try std.ArrayList(f32).resize(&data, N);
+    try file.seekTo(offset * @sizeOf(T));
 
-    const bytes = std.mem.slicesAsBytes(data.items);
-    try file.read(bytes) catch |err| {
-        std.debug.print("Error reading the model file\n", .{});
-        return err;
-    };
+    var data = try std.ArrayList(T).initCapacity(std.heap.page_allocator, N);
+    try std.ArrayList(T).resize(&data, N);
+
+    const bytes = std.mem.sliceAsBytes(data.items);
+    _ = try file.read(bytes);
 
     return data;
 }
