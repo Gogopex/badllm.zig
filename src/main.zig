@@ -191,7 +191,7 @@ fn build_tokenizer_from_vocab(filepath: []const u8, tokenizer: *Tokenizer) !void
 }
 
 // need both f32 and u32 handling for GPT2Config vs parameters
-fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, comptime T: type, offset: usize) !std.ArrayList(f32) {
+fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, comptime T: type, offset: usize) !std.ArrayList(T) {
     var file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_only });
     defer file.close();
 
