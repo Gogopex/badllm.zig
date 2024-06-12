@@ -19,8 +19,10 @@ const GPT2Config = struct {
 
 const GPT2 = struct {
     config: GPT2Config,
+    num_parameters: u32,
     params: []f32,
     params_memory: []f32,
+    params_size: [16]usize,
     activations: []f32,
     activations_memory: []f32,
     gradients: []f32,
@@ -48,8 +50,10 @@ const GPT2 = struct {
             .n_head = 0,
             .n_channels = 0,
         },
+        .num_parameters = 0,
         .params = &[_]f32{},
         .params_memory = &[_]f32{},
+        .params_size = [_]usize{0} ** 16,
         .activations = &[_]f32{},
         .activations_memory = &[_]f32{},
         .gradients = &[_]f32{},
@@ -67,6 +71,7 @@ const GPT2 = struct {
         .mean_loss = -1.0,
     };
 };
+
 //
 // const GPT = struct {
 //     config: GPT2Config,
@@ -75,27 +80,25 @@ const GPT2 = struct {
 //
 // // TODO: list all all acronyms here instead
 // // link to multiheaded attention, wte, wpe, layer norm, attention core concepts
-// const TransformerBlock = struct {
-//     word_token_embeddings: f32, // shape V, C where V is vocab size, C is embedding dims -- each word in the vocab is mapped to a vector of size C
-//     word_position_embeddings: f32, // shape maxT, C -- maxT is maximum sequence length, C is embeddingdims -- adds positional info to the token embeddings
-//     layer_norm_weights_layer_1: f32, // shape L, C -- L is the num of layers, C embedding dims
-//     layer_norm_biases_layer_1: f32, // shape L, C -- L is the num of layers, C embedding dims
-//     qkvw: f32, // shape L, 3C, C -- query key values weight projections for multiheaded attention -- L is num of layers, 3C is query/key/values concat, C is the embedding dims
-//     qkvb: f32, // shape L, 3C -- query key values bias projections for multiheaded attention
-//     attention_projection_weights: f32, // shape L, C, C -- weights of the concat output of the attention heads back to the embedding dimension
-//     attention_projection_biases: f32, // shape L, C -- biases of the concat output of the attention heads back to the embedding dimension
-//     layer_norm_weights_layer_2: f32, //
-//     layer_norm_biases_layer_2: f32,
-//     feed_forward_weights: f32, // shape L, 4C, C -- weights of the FFN
-//     feed_forward_biases: f32, // shape L, 4C -- biases of the FFN
-//     feed_forward_projection_weights: f32, // L, C, 4C -- weights for projecting the output of the FFN back to the embedding dimension
-//     final_layer_norm_weights: f32, // shape C -- final weights for the final layer norm
-//     final_layer_norm_biases: f32, // shape C -- final biases for the final layer norm
-// };
+const ParameterTensors = struct {
+    word_token_embeddings: f32, // shape V, C where V is vocab size, C is embedding dims -- each word in the vocab is mapped to a vector of size C
+    word_position_embeddings: f32, // shape maxT, C -- maxT is maximum sequence length, C is embeddingdims -- adds positional info to the token embeddings
+    layer_norm_weights_layer_1: f32, // shape L, C -- L is the num of layers, C embedding dims
+    layer_norm_biases_layer_1: f32, // shape L, C -- L is the num of layers, C embedding dims
+    qkvw: f32, // shape L, 3C, C -- query key values weight projections for multiheaded attention -- L is num of layers, 3C is query/key/values concat, C is the embedding dims
+    qkvb: f32, // shape L, 3C -- query key values bias projections for multiheaded attention
+    attention_projection_weights: f32, // shape L, C, C -- weights of the concat output of the attention heads back to the embedding dimension
+    attention_projection_biases: f32, // shape L, C -- biases of the concat output of the attention heads back to the embedding dimension
+    layer_norm_weights_layer_2: f32, //
+    layer_norm_biases_layer_2: f32,
+    feed_forward_weights: f32, // shape L, 4C, C -- weights of the FFN
+    feed_forward_biases: f32, // shape L, 4C -- biases of the FFN
+    feed_forward_projection_weights: f32, // L, C, 4C -- weights for projecting the output of the FFN back to the embedding dimension
+    final_layer_norm_weights: f32, // shape C -- final weights for the final layer norm
+    final_layer_norm_biases: f32, // shape C -- final biases for the final layer norm
+};
 
 pub fn main() !void {
-    std.debug.print("Hello, world!\n", .{});
-
     var model = GPT2.default;
     build_model_from_file("gpt2_124M.bin", &model) catch |err| {
         std.debug.print("Error building model: {}\n", .{err});
@@ -145,8 +148,57 @@ fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
         .padded_vocab_size = 0,
     };
 
-    std.debug.print("max_seq_len: {}, vocab_size: {}, n_layer: {}, n_head: {}, n_channels: {}", .{ config.max_seq_len, config.vocab_size, config.n_layer, config.n_head, config.n_channels });
+    // TODO: breakdown of how this works later
+    model.params_size[0] = config.vocab_size * config.max_seq_len;
+    model.params_size[1] = config.max_seq_len * config.n_channels;
+    model.params_size[2] = config.n_layer * config.n_channels;
+    model.params_size[3] = config.n_layer * config.n_channels;
+    model.params_size[4] = config.n_layer * (3 * config.n_channels) * config.n_channels;
+    model.params_size[5] = config.n_layer * (3 * config.n_channels);
+    model.params_size[6] = config.n_layer * config.n_channels * config.n_channels;
+    model.params_size[7] = config.n_layer * config.n_channels;
+    model.params_size[8] = config.n_layer * config.n_channels;
+    model.params_size[9] = config.n_layer * config.n_channels;
+    model.params_size[10] = config.n_layer * (4 * config.n_channels) * config.n_channels;
+    model.params_size[11] = config.n_layer * (4 * config.n_channels);
+    model.params_size[12] = config.n_layer * config.n_channels * (4 * config.n_channels);
+    model.params_size[13] = config.n_layer * config.n_channels;
+    model.params_size[14] = config.n_channels;
+    model.params_size[15] = config.n_channels;
 
+    std.debug.print("{}, {}\n", .{ model.params_size[7], model.params_size[12] });
+    std.debug.print("max_seq_len: {}, vocab_size: {}, n_layer: {}, n_head: {}, n_channels: {}\n", .{ config.max_seq_len, config.vocab_size, config.n_layer, config.n_head, config.n_channels });
+
+    var num_parameters: u32 = 0;
+    for (0..16) |i| {
+        num_parameters += @intCast(model.params_size[i]);
+    }
+
+    model.num_parameters = num_parameters;
+
+    std.debug.print("num parameters: {}\n", .{num_parameters});
+
+    const params_memory: std.ArrayList(f32) = try read_n_from_checkpoint_file(filepath, model.num_parameters, f32, 256);
+    model.params_memory = params_memory.items;
+
+    std.debug.print("params_memory[1]: {}\n", .{model.params_memory[1]});
+
+    // // read in all the parameters from file
+    // model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+    // fread(model->params_memory, sizeof(float), num_parameters, model_file);
+    // fclose(model_file);
+    //
+    // // other inits
+    // model->acts_memory = NULL;
+    // model->grads_memory = NULL;
+    // model->m_memory = NULL;
+    // model->v_memory = NULL;
+    // model->grads_acts_memory = NULL;
+    // model->inputs = NULL;
+    // model->targets = NULL;
+    // model->batch_size = 0;
+    // model->seq_len = 0;
+    // model->mean_loss = -1.0f; // -1.0f will designate no loss
     model.config = config;
 }
 
@@ -196,9 +248,7 @@ fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, comptime T: type,
     defer file.close();
 
     const file_size = try file.getEndPos();
-    if (file_size < N * @sizeOf(T)) {
-        return error.FileTooSmall;
-    }
+    std.debug.print("{}, {}, {} \n", .{ file_size, N, @sizeOf(T) });
     if (file_size == 0) {
         return error.FileEmpty;
     }
