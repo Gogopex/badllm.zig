@@ -99,21 +99,36 @@ const ParameterTensors = struct {
 };
 
 pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var model = GPT2.default;
     build_model_from_file("gpt2_124M.bin", &model) catch |err| {
         std.debug.print("Error building model: {}\n", .{err});
         return;
     };
 
-    // var tokenizer: Tokenizer = undefined;
-    // if (build_tokenizer_from_vocab("gpt2_tokenizer.bin", &tokenizer)) |err| {
-    //     std.debug.print("Error building tokenizer: {}\n", .{err});
-    //     return;
-    // } else |_| {
-    //     std.debug.print("Tokenizer built successfully\n", .{});
-    // }
-
-    // const pos_encodings = load_positional_encodings("gpt2_124M.bin", 1024, 768);
+    // TODO: write-up on why 4 and 64
+    var loader: DataLoader = undefined;
+    try dataloader_init(allocator, &loader, "data/tiny_shakespeare_train.bin", loader.B, loader.T);
+    std.debug.print("train dataset num_batches: {}\n", .{loader.num_batches});
+    // // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
+    // char* tiny_stories_train = "data/TinyStories_train.bin";
+    // char* tiny_stories_val = "data/TinyStories_val.bin";
+    // char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
+    // char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
+    // char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
+    // char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
+    // int B = 4;
+    // int T = 64;
+    // DataLoader train_loader;
+    // dataloader_init(&train_loader, train_tokens, B, T);
+    // printf("train dataset num_batches: %d\n", train_loader.num_batches);
+    // DataLoader val_loader;
+    // dataloader_init(&val_loader, val_tokens, B, T);
+    // printf("val dataset num_batches: %d\n", val_loader.num_batches);
+    // int val_num_batches = 10;
 }
 
 // pub fn gelu(x: f32) f32 {
@@ -133,6 +148,17 @@ pub fn main() !void {
 // }
 
 const Tokenizer = struct { vocabulary_size: u32, init: bool, data: []u8 };
+const DataLoader = struct {
+    B: u32,
+    T: u32,
+    tokens_file: std.fs.File,
+    file_size: u64,
+    current_position: u32,
+    batch: []u32,
+    inputs: []u32,
+    targets: []u32,
+    num_batches: u64,
+};
 
 fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
     const t = try read_n_from_checkpoint_file(filepath, 256, u32, 0);
@@ -148,7 +174,8 @@ fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
         .padded_vocab_size = 0,
     };
 
-    // TODO: breakdown of how this works later
+    // TODO: breakdown and explanation for newbies
+    // at this point I might as well turn the repo into a full-on breakdown of decoder-only transformers
     model.params_size[0] = config.vocab_size * config.max_seq_len;
     model.params_size[1] = config.max_seq_len * config.n_channels;
     model.params_size[2] = config.n_layer * config.n_channels;
@@ -264,13 +291,39 @@ fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, comptime T: type,
     return data;
 }
 
-fn fill_in_param_sizes(file: std.fs.File, param_sizes: std.ArrayList(usize)) void {
-    const size = std.mem.zeroes(i32);
-    file.readAll(std.mem.bytesAsSlice(u8, size)) catch {
-        std.debug.print("Error reading the model file\n", .{});
-        std.posix.exit(1);
-    };
-    param_sizes.append(@intCast(size));
+fn dataloader_init(allocator: std.mem.Allocator, loader: *DataLoader, filepath: []const u8, B: u32, T: u32) !void {
+    loader.B = B;
+    loader.T = T;
+
+    var file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_only });
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    std.debug.print("{} \n", .{file_size});
+    if (file_size == 0) {
+        return error.FileEmpty;
+    }
+    loader.file_size = file_size;
+    loader.current_position = 0;
+    loader.batch = allocator.alloc(u32, B * T + 1) catch unreachable;
+    loader.inputs = loader.batch;
+    loader.targets = loader.batch[1..];
+    loader.num_batches = file_size / (B * T * @sizeOf(u32));
+}
+
+fn data_loader_reset(loader: *DataLoader) void {
+    loader.current_position = 0;
+}
+
+fn data_loader_next_batch(loader: *DataLoader) void {
+    const B = loader.B;
+    const T = loader.T;
+    if (loader.current_position + (B * T + 1) * @sizeOf(u32) > loader.file_size) {
+        loader.current_position = 0;
+    }
+    try loader.tokens_file.seekTo(loader.current_position);
+    try loader.tokens_file.readAll(std.mem.sliceAsBytes(loader.batch));
+    loader.current_position += B * T * @sizeOf(u32);
 }
 
 // fn load_embeddings(filepath: []const u8, vocab_size: usize, embedding_dim: usize) []f32 {
