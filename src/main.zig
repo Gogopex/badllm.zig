@@ -110,25 +110,25 @@ const ParameterTensors = struct {
 
 const ActivationTensors = struct {
     encoded: []f32, // (B, T, C)
-    ln1: []f32, // (L, B, T, C)
-    ln1_mean: []f32, // (L, B, T)
-    ln1_rstd: []f32, // (L, B, T)
-    qkv: []f32, // (L, B, T, 3*C)
-    atty: []f32, // (L, B, T, C)
-    preatt: []f32, // (L, B, NH, T, T)
-    att: []f32, // (L, B, NH, T, T)
-    attproj: []f32, // (L, B, T, C)
-    residual2: []f32, // (L, B, T, C)
-    ln2: []f32, // (L, B, T, C)
-    ln2_mean: []f32, // (L, B, T)
-    ln2_rstd: []f32, // (L, B, T)
-    fch: []f32, // (L, B, T, 4*C)
-    fch_gelu: []f32, // (L, B, T, 4*C)
-    fcproj: []f32, // (L, B, T, C)
-    residual3: []f32, // (L, B, T, C)
-    lnf: []f32, // (B, T, C)
-    lnf_mean: []f32, // (B, T)
-    lnf_rstd: []f32, // (B, T)
+    ln1: []f32, // (L, B, T, C), layer norm 1
+    ln1_mean: []f32, // (L, B, T), layer norm 1 mean
+    ln1_rstd: []f32, // (L, B, T), layer norm 1 r
+    qkv: []f32, // (L, B, T, 3*C), reciprocal of standard deviation
+    atty: []f32, // (L, B, T, C), attention output
+    preatt: []f32, // (L, B, NH, T, T), pre-attention
+    att: []f32, // (L, B, NH, T, T), attention
+    attproj: []f32, // (L, B, T, C), attention projection
+    residual2: []f32, // (L, B, T, C), residual 2
+    ln2: []f32, // (L, B, T, C), layer norm 2
+    ln2_mean: []f32, // (L, B, T), layer norm 2 mean
+    ln2_rstd: []f32, // (L, B, T), layer norm 2 reciprocal of standard deviation
+    fch: []f32, // (L, B, T, 4*C), fully connected hidden
+    fch_gelu: []f32, // (L, B, T, 4*C), fully connected hidden gelu
+    fcproj: []f32, // (L, B, T, C), fully connected projection
+    residual3: []f32, // (L, B, T, C), residual 3
+    lnf: []f32, // (B, T, C), layer norm final
+    lnf_mean: []f32, // (B, T), layer norm final mean
+    lnf_rstd: []f32, // (B, T), layer norm final reciprocal of standard deviation
     logits: []f32, // (B, T, V)
     probs: []f32, // (B, T, V)
     losses: []f32, // (B, T)
@@ -369,6 +369,38 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: GPT2, inputs: []u32, ta
 
         // activations for this layer
         // TODO: continue here
+        //     float* l_ln1 = acts.ln1 + l * B * T * C;
+        //     float* l_ln1_mean = acts.ln1_mean + l * B * T;
+        //     float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+        //     float* l_qkv = acts.qkv + l * B * T * 3*C;
+        //     float* l_atty = acts.atty + l * B * T * C;
+        //     float* l_preatt = acts.preatt + l * B * NH * T * T;
+        //     float* l_att = acts.att + l * B * NH * T * T;
+        //     float* l_attproj = acts.attproj + l * B * T * C;
+        //     float* l_residual2 = acts.residual2 + l * B * T * C;
+        //     float* l_ln2 = acts.ln2 + l * B * T * C;
+        //     float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        //     float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+        //     float* l_fch = acts.fch + l * B * T * 4*C;
+        //     float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        //     float* l_fcproj = acts.fcproj + l * B * T * C;
+        //     float* l_residual3 = acts.residual3 + l * B * T * C;
+        const l_ln1 = acts.layer_norm1[l * B * T * C];
+        const l_ln1_mean = acts.layer_norm1_mean[l * B * T * C];
+        const l_ln1_rstd = acts.layer_norm1_rstd[l * B * T * C];
+        const l_qkv = acts.qkv[l * B * T * 3*C];
+        const l_atty = acts.attention_output[l * B * T * C];
+        const l_preatt = acts.pre_attention[l * B * NH * T * T];
+        const l_att = acts.attention[l * B * NH * T * T];
+        const l_attproj = acts.attention_projection[l * B * T * C];
+        const l_residual2 = acts.residual2[l * B * T * C];
+        const l_ln2 = acts.layer_norm2[l * B * T * C];
+        const l_ln2_mean = acts.layer_norm2_mean[l * B * T * C];
+        const l_ln2_rstd = acts.layer_norm2_rstd[l * B * T * C];
+        const l_fch = acts.fully_connected_hidden[l * B * T * 4*C];
+        const l_fch_gelu = acts.fully_connected_hidden_gelu[l * B * T * 4*C];
+        const l_fcproj = acts.fully_connected_projection[l * B * T * C];
+        const l_residual3 = acts.residual3[l * B * T * C];
     }
     //  for (int l = 0; l < L; l++) {
     //
