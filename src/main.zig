@@ -28,11 +28,12 @@ const GPT2Config = struct {
 const GPT2 = struct {
     config: GPT2Config,
     num_parameters: u32,
-    params: []f32,
+    params: ParameterTensors,
     params_memory: []f32,
     params_size: [16]usize,
-    activations: []f32,
+    activations: ActivationTensors,
     activations_memory: []f32,
+    num_activations: u32,
     activation_sizes: [23]usize,
     gradients: []f32,
     gradients_memory: []f32,
@@ -43,43 +44,11 @@ const GPT2 = struct {
     m_memory: []f32,
     v: []f32,
     v_memory: []f32,
-    inputs: ?[]u8,
-    targets: ?[]u8,
+    inputs: []u32,
+    targets: []u32,
     batch_size: usize = 0,
     seq_len: usize = 0,
     mean_loss: f32 = -1.0, // TODO ?
-
-    var default = GPT2{
-        .config = GPT2Config{
-            .max_seq_len = 0,
-            .vocab_size = 0,
-            .padded_vocab_size = 0,
-            .n_layer = 0,
-            .n_embed = 0,
-            .n_head = 0,
-            .n_channels = 0,
-        },
-        .num_parameters = 0,
-        .params = &[_]f32{},
-        .params_memory = &[_]f32{},
-        .params_size = [_]usize{0} ** 16,
-        .activations = &[_]f32{},
-        .activations_memory = &[_]f32{},
-        .activation_sizes = [_]usize{0} ** 23, // explain to non-ziglets
-        .gradients = &[_]f32{},
-        .gradients_memory = &[_]f32{},
-        .gradients_activations = &[_]f32{},
-        .gradients_activations_memory = &[_]f32{},
-        .m = &[_]f32{},
-        .m_memory = &[_]f32{},
-        .v = &[_]f32{},
-        .v_memory = &[_]f32{},
-        .inputs = null,
-        .targets = null,
-        .batch_size = 0,
-        .seq_len = 0,
-        .mean_loss = -1.0,
-    };
 };
 
 //
@@ -91,10 +60,11 @@ const GPT2 = struct {
 // // TODO: list all all acronyms here instead
 // // link to multiheaded attention, wte, wpe, layer norm, attention core concepts
 const ParameterTensors = struct {
-    word_token_embeddings: f32, // shape V, C where V is vocab size, C is embedding dims -- each word in the vocab is mapped to a vector of size C
-    word_position_embeddings: f32, // shape maxT, C -- maxT is maximum sequence length, C is embeddingdims -- adds positional info to the token embeddings
-    layer_norm_weights_layer_1: f32, // shape L, C -- L is the num of layers, C embedding dims
-    layer_norm_biases_layer_1: f32, // shape L, C -- L is the num of layers, C embedding dims
+    encoded: []f32,
+    word_token_embeddings: []f32, // shape V, C where V is vocab size, C is embedding dims -- each word in the vocab is mapped to a vector of size C
+    word_position_embeddings: []f32, // shape maxT, C -- maxT is maximum sequence length, C is embeddingdims -- adds positional info to the token embeddings
+    layer_norm_weights_layer_1: []f32, // shape L, C -- L is the num of layers, C embedding dims
+    layer_norm_biases_layer_1: []f32, // shape L, C -- L is the num of layers, C embedding dims
     qkvw: f32, // shape L, 3C, C -- query key values weight projections for multiheaded attention -- L is num of layers, 3C is query/key/values concat, C is the embedding dims
     qkvb: f32, // shape L, 3C -- query key values bias projections for multiheaded attention
     attention_projection_weights: f32, // shape L, C, C -- weights of the concat output of the attention heads back to the embedding dimension
@@ -138,7 +108,7 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var model = GPT2.default;
+    var model: GPT2 = undefined;
     build_model_from_file("gpt2_124M.bin", &model) catch |err| {
         std.debug.print("Error building model: {}\n", .{err});
         return;
@@ -156,36 +126,33 @@ pub fn main() !void {
     std.debug.print("val dataset num_batches: {}\n", .{val_loader.num_batches});
 
     const val_num_batches = 10;
-    const rng_state = 1337;
+    // const rng_state = 1337;
     const gen_max_length = 64;
     var gen_tokens: [gen_max_length]u32 = undefined;
 
-    var prng = std.rand.DefaultPrng.init(blk: {
-        var seed: u64 = undefined;
-        try std.os.getrandom(std.mem.asBytes(&seed));
-        break :blk seed;
-    });
+    const state = 1337;
+    var prng = std.rand.DefaultPrng.init(state);
     const rand = prng.random();
 
-    var ts: std.posix.timespec = undefined;
     for (0..40) |step| {
         if (step % 10 == 0) {
             var val_loss: f32 = 0.0;
             data_loader_reset(&val_loader);
             for (0..val_num_batches) |_| {
-                data_loader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                try data_loader_next_batch(&val_loader);
+                try gpt2_forward(allocator, &model, val_loader.inputs, val_loader.targets, B, T);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            std.debug.print("val loss: {}\n", .{val_loss});
+            std.debug.print("Val loss: {}\n", .{val_loss});
         }
         if (step > 0 and step % 20 == 0) {
             gen_tokens[0] = 50256;
 
             for (1..gen_max_length) |t| {
-                gpt2_forward(&model, gen_tokens, null, 1, t);
-                const probs = model.acts.probs + (t - 1) * model.config.vocab_size;
+                const no_targs: []u32 = undefined; // @todo maybe make targets ? in gpt2_forward and switch on null
+                try gpt2_forward(allocator, &model, &gen_tokens, no_targs, 1, @intCast(t));
+                const probs = model.activations.probs[(t - 1) * model.config.vocab_size ..];
                 const coin = rand.float(f32);
                 const next_token = sample_mult(probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
@@ -196,15 +163,11 @@ pub fn main() !void {
             }
             std.debug.print("\n", .{});
         }
-        posix.times(&ts);
-        data_loader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        try data_loader_next_batch(&train_loader);
+        try gpt2_forward(allocator, &model, train_loader.inputs, train_loader.targets, B, T);
         // gpt2_zero_grad(&model);
         // gpt2_backward(&model);
         // gpt2_update(&model, 1e-4, 0.9, 0.999, 1e-8, 0.0, step + 1);
-        posix.times(&ts);
-        const time_elapsed_s = (ts.tv_sec - ts.tv_sec) + (ts.tv_nsec - ts.tv_nsec) / 1e9;
-        std.debug.print("step {}: train loss {} (took {} ms)\n", .{ step, model.mean_loss, time_elapsed_s * 1000 });
     }
 
     // some memory for generating samples from the model
@@ -262,37 +225,25 @@ pub fn main() !void {
     //     printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
 }
 
-// int sample_mult(float* probabilities, int n, float coin) {
-//     // sample index from probabilities (they must sum to 1!)
-//     // coin is a random number in [0, 1), usually from random_f32()
-//     float cdf = 0.0f;
-//     for (int i = 0; i < n; i++) {
-//         cdf += probabilities[i];
-//         if (coin < cdf) {
-//             return i;
-//         }
-//     }
-//     return n - 1; // in case of rounding errors
-// }
-
-fn sample_mult(probabilities: f32, n: u32, coin: f32) void {
+fn sample_mult(probabilities: []f32, n: u32, coin: f32) u32 {
     // sample index from probabilities (they must sum to 1!)
     // coin is a random number in [0, 1), usually from random_f32()
 
-    const cdf = 0.0;
+    var cdf: f32 = 0.0;
 
     for (0..n) |i| {
         cdf += probabilities[i];
         if (coin < cdf) {
-            return i;
+            return @as(u32, @intCast(i));
         }
     }
     return n - 1; // in case of rounding errors
 
 }
 
-pub fn gpt2_forward(allocator: std.mem.Allocator, model: GPT2, inputs: []u32, targets: []u32, B: u32, T: u32) !void {
-    if (model.params_memory == null) {
+pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, targets: []u32, B: u32, T: u32) !void {
+    // @TODO: handle eventual null
+    if (model.params_memory.len == 0) {
         std.debug.print("Error: model was not initialized properly.\n", .{});
 
         return ModelError.ModelNotInitialized;
@@ -304,36 +255,36 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: GPT2, inputs: []u32, ta
     const NH = model.config.n_head;
     const C = model.config.n_channels;
 
-    if (model.activations_memory == null) {
+    if (model.activations_memory.len == 0) {
         model.seq_len = T;
-        model.act_sizes[0] = B * T * C;
-        model.act_sizes[1] = L * B * T * C;
-        model.act_sizes[2] = L * B * T;
-        model.act_sizes[3] = L * B * T;
-        model.act_sizes[4] = L * B * T * 3 * C;
-        model.act_sizes[5] = L * B * T * C;
-        model.act_sizes[6] = L * B * NH * T * T;
-        model.act_sizes[7] = L * B * NH * T * T;
-        model.act_sizes[8] = L * B * T * C;
-        model.act_sizes[9] = L * B * T * C;
-        model.act_sizes[10] = L * B * T * C;
-        model.act_sizes[11] = L * B * T;
-        model.act_sizes[12] = L * B * T;
-        model.act_sizes[13] = L * B * T * 4 * C;
-        model.act_sizes[14] = L * B * T * 4 * C;
-        model.act_sizes[15] = L * B * T * C;
-        model.act_sizes[16] = L * B * T * C;
-        model.act_sizes[17] = B * T * C;
-        model.act_sizes[18] = B * T;
-        model.act_sizes[19] = B * T;
-        model.act_sizes[20] = B * T * V;
-        model.act_sizes[21] = B * T * V;
-        model.act_sizes[22] = B * T;
+        model.activation_sizes[0] = B * T * C;
+        model.activation_sizes[1] = L * B * T * C;
+        model.activation_sizes[2] = L * B * T;
+        model.activation_sizes[3] = L * B * T;
+        model.activation_sizes[4] = L * B * T * 3 * C;
+        model.activation_sizes[5] = L * B * T * C;
+        model.activation_sizes[6] = L * B * NH * T * T;
+        model.activation_sizes[7] = L * B * NH * T * T;
+        model.activation_sizes[8] = L * B * T * C;
+        model.activation_sizes[9] = L * B * T * C;
+        model.activation_sizes[10] = L * B * T * C;
+        model.activation_sizes[11] = L * B * T;
+        model.activation_sizes[12] = L * B * T;
+        model.activation_sizes[13] = L * B * T * 4 * C;
+        model.activation_sizes[14] = L * B * T * 4 * C;
+        model.activation_sizes[15] = L * B * T * C;
+        model.activation_sizes[16] = L * B * T * C;
+        model.activation_sizes[17] = B * T * C;
+        model.activation_sizes[18] = B * T;
+        model.activation_sizes[19] = B * T;
+        model.activation_sizes[20] = B * T * V;
+        model.activation_sizes[21] = B * T * V;
+        model.activation_sizes[22] = B * T;
 
-        const num_activations = 0;
+        var num_activations: u32 = 0;
 
         for (0..NUM_ACTIVATION_TENSORS) |i| {
-            num_activations += model.act_sizes[i];
+            num_activations += @intCast(model.activation_sizes[i]);
         }
         std.debug.print("num_activations: {}", .{num_activations});
         model.num_activations = num_activations;
@@ -347,117 +298,85 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: GPT2, inputs: []u32, ta
             return ModelError.BatchSizeTooLarge;
         }
     }
-    std.mem.copy(model.inputs, inputs, B * T * @sizeOf(u32));
-    if (targets != null) {
-        std.mem.copy(model.targets, targets, B * T * @sizeOf(u32));
+
+    @memset(model.activations_memory, 0);
+    if (model.inputs.len > inputs.len) {
+        @memcpy(model.inputs, inputs);
     }
 
-    const params: ParameterTensors = model.params; // ???
-    const acts: ActivationTensors = model.activations; // ???
-    const residual: f32 = undefined;
-    for (0..L) |l| {
-        residual = if (1 == 0) acts.encoded else acts.residual3 + (l-1) * B * T * C;
+    if (targets.len != 0) {
+        @memcpy(model.targets, targets);
+    } else {
+        model.inputs = try allocator.realloc(model.inputs, inputs.len);
+        @memcpy(model.targets, targets);
+    }
+    // @TODO: attemping encoder forward pass
+    // const vec_size: usize = 8;
+    // if ((C % vec_size == 0) and (C > vec_size)) {
+    //     encoder_forward_vec(vec_size, model.activations.encoded, inputs, model.params.word_token_embeddings, B, T, C);
+    // }
+    encoder_forward(model.activations.encoded, inputs, model.params.word_token_embeddings, model.params.word_position_embeddings, B, T, C);
 
+    //////////
+    // const params: ParameterTensors = model.params; // ???
+    // const acts: ActivationTensors = model.activations; // ???
+    var residual: []f32 = undefined;
+    for (0..L) |l| {
+        residual = if (1 == 0) model.activations.encoded else model.activations.residual3[(l - 1) * B * T * C ..];
 
         // weights for this layer
-        const l_ln1w = params.layer_norm_weights_layer_1[l * C..];
-        const l_ln1b = params.layer_norm_biases_layer_1[l * C..];
-        const l_qkvw = params.qkvw[l * 3*C * C];
-        const l_qkvb = params.qkvb[l * 3*C];
-        const l_attprojw = params.attention_projection_weights[l * C * C];
-        const l_attprojb = params.attention_projection_biases[l * C];
+        const l_ln1w = model.params.layer_norm_weights_layer_1[l * C ..];
+        const l_ln1b = model.params.layer_norm_biases_layer_1[l * C ..];
+        // @TODO: commented cuz unimplemented and compiler whining
+        // const l_qkvw = params.qkvw[l * 3 * C * C];
+        // const l_qkvb = params.qkvb[l * 3 * C];
+        // const l_attprojw = params.attention_projection_weights[l * C * C];
+        // const l_attprojb = params.attention_projection_biases[l * C];
 
         // activations for this layer
         // TODO: continue here
-        //     float* l_ln1 = acts.ln1 + l * B * T * C;
-        //     float* l_ln1_mean = acts.ln1_mean + l * B * T;
-        //     float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        //     float* l_qkv = acts.qkv + l * B * T * 3*C;
-        //     float* l_atty = acts.atty + l * B * T * C;
-        //     float* l_preatt = acts.preatt + l * B * NH * T * T;
-        //     float* l_att = acts.att + l * B * NH * T * T;
-        //     float* l_attproj = acts.attproj + l * B * T * C;
-        //     float* l_residual2 = acts.residual2 + l * B * T * C;
-        //     float* l_ln2 = acts.ln2 + l * B * T * C;
-        //     float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        //     float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        //     float* l_fch = acts.fch + l * B * T * 4*C;
-        //     float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        //     float* l_fcproj = acts.fcproj + l * B * T * C;
-        //     float* l_residual3 = acts.residual3 + l * B * T * C;
-        const l_ln1 = acts.layer_norm1[l * B * T * C];
-        const l_ln1_mean = acts.layer_norm1_mean[l * B * T * C];
-        const l_ln1_rstd = acts.layer_norm1_rstd[l * B * T * C];
-        const l_qkv = acts.qkv[l * B * T * 3*C];
-        const l_atty = acts.attention_output[l * B * T * C];
-        const l_preatt = acts.pre_attention[l * B * NH * T * T];
-        const l_att = acts.attention[l * B * NH * T * T];
-        const l_attproj = acts.attention_projection[l * B * T * C];
-        const l_residual2 = acts.residual2[l * B * T * C];
-        const l_ln2 = acts.layer_norm2[l * B * T * C];
-        const l_ln2_mean = acts.layer_norm2_mean[l * B * T * C];
-        const l_ln2_rstd = acts.layer_norm2_rstd[l * B * T * C];
-        const l_fch = acts.fully_connected_hidden[l * B * T * 4*C];
-        const l_fch_gelu = acts.fully_connected_hidden_gelu[l * B * T * 4*C];
-        const l_fcproj = acts.fully_connected_projection[l * B * T * C];
-        const l_residual3 = acts.residual3[l * B * T * C];
+        const l_ln1 = model.activations.ln1[l * B * T * C ..];
+        const l_ln1_mean = model.activations.ln1_mean[l * B * T * C ..];
+        const l_ln1_rstd = model.activations.ln1_rstd[l * B * T * C ..];
+        // @TODO: commented cuz unused and compiler whining
+        // const l_qkv = acts.qkv[l * B * T * 3 * C];
+        // const l_atty = acts.attention_output[l * B * T * C];
+        // const l_preatt = acts.pre_attention[l * B * NH * T * T];
+        // const l_att = acts.attention[l * B * NH * T * T];
+        // const l_attproj = acts.attention_projection[l * B * T * C];
+        // const l_residual2 = acts.residual2[l * B * T * C];
+        // const l_ln2 = acts.layer_norm2[l * B * T * C];
+        // const l_ln2_mean = acts.layer_norm2_mean[l * B * T * C];
+        // const l_ln2_rstd = acts.layer_norm2_rstd[l * B * T * C];
+        // const l_fch = acts.fully_connected_hidden[l * B * T * 4 * C];
+        // const l_fch_gelu = acts.fully_connected_hidden_gelu[l * B * T * 4 * C];
+        // const l_fcproj = acts.fully_connected_projection[l * B * T * C];
+        // const l_residual3 = acts.residual3[l * B * T * C];
+
+        layer_norm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        // matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        // attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        // matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        // residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        // layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        // matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        // gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        // matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        // residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
-    //  for (int l = 0; l < L; l++) {
+
+    residual = model.activations.residual3[(L - 1) * B * T * C ..]; // last residual is in residual3
+    layer_norm_forward(model.activations.lnf, model.activations.lnf_mean, model.activations.lnf_rstd, residual, model.params.layer_norm_weights_layer_1, model.params.layer_norm_biases_layer_1, B, T, C);
+    // matmul_forward(acts.logits, acts.lnf, params.wte, B, T, C, V);
     //
-    //     residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-    //
-    //     // get the pointers of the weights for this layer
-    //     float* l_ln1w = params.ln1w + l * C;
-    //     float* l_ln1b = params.ln1b + l * C;
-    //     float* l_qkvw = params.qkvw + l * 3*C * C;
-    //     float* l_qkvb = params.qkvb + l * 3*C;
-    //     float* l_attprojw = params.attprojw + l * C * C;
-    //     float* l_attprojb = params.attprojb + l * C;
-    //     float* l_ln2w = params.ln2w + l * C;
-    //     float* l_ln2b = params.ln2b + l * C;
-    //     float* l_fcw = params.fcw + l * 4*C * C;
-    //     float* l_fcb = params.fcb + l * 4*C;
-    //     float* l_fcprojw = params.fcprojw + l * C * 4*C;
-    //     float* l_fcprojb = params.fcprojb + l * C;
-    //
-    //     // get the pointers of the activations for this layer
-    //     float* l_ln1 = acts.ln1 + l * B * T * C;
-    //     float* l_ln1_mean = acts.ln1_mean + l * B * T;
-    //     float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-    //     float* l_qkv = acts.qkv + l * B * T * 3*C;
-    //     float* l_atty = acts.atty + l * B * T * C;
-    //     float* l_preatt = acts.preatt + l * B * NH * T * T;
-    //     float* l_att = acts.att + l * B * NH * T * T;
-    //     float* l_attproj = acts.attproj + l * B * T * C;
-    //     float* l_residual2 = acts.residual2 + l * B * T * C;
-    //     float* l_ln2 = acts.ln2 + l * B * T * C;
-    //     float* l_ln2_mean = acts.ln2_mean + l * B * T;
-    //     float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-    //     float* l_fch = acts.fch + l * B * T * 4*C;
-    //     float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-    //     float* l_fcproj = acts.fcproj + l * B * T * C;
-    //     float* l_residual3 = acts.residual3 + l * B * T * C;
-    //
-    //     // now do the forward pass
-    //     layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-    //     matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-    //     attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
-    //     matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-    //     residual_forward(l_residual2, residual, l_attproj, B*T*C);
-    //     layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-    //     matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-    //     gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-    //     matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-    //     residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
-    // }
+
     // residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     // layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
     // matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
     // softmax_forward(acts.probs, acts.logits, B, T, V);
-    //
-    // // also forward the cross-entropy loss function if we have the targets
     // if (targets != NULL) {
-    //     crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, V);
+    //    crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, V);//    float
+    //    // C CODE BELOW
     //     // for convenience also evaluate the mean loss
     //     float mean_loss = 0.0f;
     //     for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
@@ -469,44 +388,64 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: GPT2, inputs: []u32, ta
     // }
 }
 
-// void encoder_forward(float* out,
-//                    int* inp, float* wte, float* wpe,
-//                    int B, int T, int C) {
-//     for (int b = 0; b < B; b++) {
-//         for (int t = 0; t < T; t++) {
-//             // seek to the output position in out[b,t,:]
-//             float* out_bt = out + b * T * C + t * C;
-//             // get the index of the token at inp[b, t]
-//             int ix = inp[b * T + t];
-//             // seek to the position in wte corresponding to the token
-//             float* wte_ix = wte + ix * C;
-//             // seek to the position in wpe corresponding to the position
-//             float* wpe_t = wpe + t * C;
-//             // add the two vectors and store the result in out[b,t,:]
-//             for (int i = 0; i < C; i++) {
-//                 out_bt[i] = wte_ix[i] + wpe_t[i];
-//             }
-//         }
-//     }
-// }
-
-fn encoder_forward(out: []f32, inp: []u32, wte: []f32, wpe: []f32, B: u32, T: u32, C: u32) void {
+// @TODO: vectorized version fn encoder_forward_vec(comptime...)
+fn layer_norm_forward(out: []f32, mean: []f32, rstd: []f32, inp: []f32, weight: []f32, bias: []f32, B: u32, T: u32, C: u32) void {
+    const eps = 1e-5;
     for (0..B) |b| {
         for (0..T) |t| {
-            var out_bt = out + b * T * C + t * C;
-            var ix = inp[b * T + t];
-            var wte_ix = wte + ix * C;
-            var wpe_t = wpe + t * C;
+            const x = inp[b * T * C + t * C ..];
+            var m: f32 = 0.0;
             for (0..C) |i| {
-                out_bt[i] = wte_ix[i] + wpe_t[i];
+                m += x[i];
+            }
+            m /= @floatFromInt(C);
+            var v: f32 = 0.0;
+            for (0..C) |i| {
+                const xshift = x[i] - m;
+                v += xshift * xshift;
+            }
+            v /= @floatFromInt(C);
+            const s = 1.0 / std.math.sqrt(v + eps);
+            var out_bt = out[b * T * C + t * C ..];
+            for (0..C) |i| {
+                const n = (s * (x[i] - m));
+                const o = n * weight[i] + bias[i];
+                out_bt[i] = o;
+            }
+            mean[b * T + t] = m;
+            rstd[b * T + t] = s;
         }
     }
 }
 
+// @TODO: rawdogged straight from Karpathy -- zig tricks?
+fn encoder_forward(out: []f32, inp: []u32, wte: []f32, wpe: []f32, B: u32, T: u32, C: u32) void {
+    for (0..B) |b| {
+        for (0..T) |t| {
+            // seek to the output position in out[b,t,:]
+            var out_bt = out[b * T * C + t * C ..];
+            // get the index of the token at inp[b, t]
+            const ix = inp[b * T + t];
+            // seek to the position in wte corresponding to the token
+            const wte_ix = wte[ix * C ..];
+            // seek to the position in wpe corresponding to the position
+            const wpe_t = wpe[t * C ..];
+            // add the two vectors and store the result in out[b,t,:]
+            for (0..C) |i| {
+                out_bt[i] = wte_ix[i] + wpe_t[i];
+            }
+        }
+    }
+}
+
+// fn matmul_forward(logits: []f32, lnf: []f32, wte: []f32, B: u32, T: u32, C: u32, V: u32) void {}
+
+// TODO: old mess to clean up
 // pub fn gelu(x: f32) f32 {
 //     return 0.5 * x * (1.0 + std.math.tan(std.math.sqrt(2.0 / std.math.pi) * (x + 0.044715 * pow(x, 3.9))));
 // }
 
+// TODO: old mess to clean up
 // fn layer_norm(x: []f32, eps: f32) []32 {
 //     const mean = std.math.mean(x);
 //     const variance = std.math.variance(x, mean);
@@ -546,8 +485,10 @@ fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
         .padded_vocab_size = 0,
     };
 
+    model.config = config;
+
     // TODO: breakdown and explanation for newbies
-    // at this point I might as well turn the repo into a full-on breakdown of decoder-only transformers
+    // at this point I might as well turn the repo into a full-on breakdown of a transformer's forward pass
     model.params_size[0] = config.vocab_size * config.max_seq_len;
     model.params_size[1] = config.max_seq_len * config.n_channels;
     model.params_size[2] = config.n_layer * config.n_channels;
@@ -677,7 +618,6 @@ fn dataloader_init(allocator: std.mem.Allocator, loader: *DataLoader, filepath: 
     }
     loader.file_size = file_size;
     loader.current_position = 0;
-    std.debug.print("B, T: {}, {}", .{ B, T });
     loader.batch = try allocator.alloc(u32, (B * T + 1) * @sizeOf(u32));
     loader.inputs = loader.batch;
     loader.targets = loader.batch[1..];
@@ -688,15 +628,23 @@ fn data_loader_reset(loader: *DataLoader) void {
     loader.current_position = 0;
 }
 
-fn data_loader_next_batch(loader: *DataLoader) void {
-    const B = loader.B;
-    const T = loader.T;
-    if (loader.current_position + (B * T + 1) * @sizeOf(u32) > loader.file_size) {
+fn data_loader_next_batch(loader: *DataLoader) !void {
+    std.debug.print("File handle: {}\n", .{loader.tokens_file});
+    std.debug.print("File size: {} bytes\n", .{loader.file_size});
+    std.debug.print("Current position: {}\n", .{loader.current_position});
+    std.debug.print("Next batch size: {} bytes\n", .{(loader.B * loader.T + 1) * @sizeOf(u32)});
+    if (loader.current_position + (loader.B * loader.T + 1) * @sizeOf(u32) >= loader.file_size) {
+        std.debug.print("test in if", .{});
         loader.current_position = 0;
     }
-    try loader.tokens_file.seekTo(loader.current_position);
-    try loader.tokens_file.readAll(std.mem.sliceAsBytes(loader.batch));
-    loader.current_position += B * T * @sizeOf(u32);
+    const result = loader.tokens_file.seekTo(loader.current_position);
+    if (result) |_| {
+        // Successfully seeked to position
+        std.debug.print(" seeking to position:\n", .{});
+    } else |err| {
+        std.debug.print("Error seeking to position: {}\n", .{err});
+    }
+    loader.current_position += loader.B * loader.T * @sizeOf(u32);
 }
 
 // fn load_embeddings(filepath: []const u8, vocab_size: usize, embedding_dim: usize) []f32 {
