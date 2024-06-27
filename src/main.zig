@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 const NUM_ACTIVATION_TENSORS = 23;
@@ -34,7 +35,7 @@ const GPT2 = struct {
     activations: ActivationTensors,
     activations_memory: []f32,
     num_activations: u32,
-    activation_sizes: [23]usize,
+    activation_sizes: [23]u32,
     gradients: []f32,
     gradients_memory: []f32,
     gradients_activations: []f32,
@@ -121,6 +122,7 @@ pub fn main() !void {
     try dataloader_init(allocator, &train_loader, "data/tiny_shakespeare_train.bin", B, T);
     std.debug.print("train dataset num_batches: {}\n", .{train_loader.num_batches});
 
+    std.debug.print("train_loader file: {}", .{train_loader.tokens_file});
     var val_loader: DataLoader = undefined;
     try dataloader_init(allocator, &val_loader, "data/tiny_shakespeare_val.bin", B, T);
     std.debug.print("val dataset num_batches: {}\n", .{val_loader.num_batches});
@@ -138,6 +140,7 @@ pub fn main() !void {
         if (step % 10 == 0) {
             var val_loss: f32 = 0.0;
             data_loader_reset(&val_loader);
+            std.debug.print("val_loader: {}", .{val_loader.file_size});
             for (0..val_num_batches) |_| {
                 try data_loader_next_batch(&val_loader);
                 try gpt2_forward(allocator, &model, val_loader.inputs, val_loader.targets, B, T);
@@ -165,7 +168,7 @@ pub fn main() !void {
         }
         try data_loader_next_batch(&train_loader);
         try gpt2_forward(allocator, &model, train_loader.inputs, train_loader.targets, B, T);
-        // gpt2_zero_grad(&model);
+        gpt2_zero_grad(&model);
         // gpt2_backward(&model);
         // gpt2_update(&model, 1e-4, 0.9, 0.999, 1e-8, 0.0, step + 1);
     }
@@ -241,6 +244,15 @@ fn sample_mult(probabilities: []f32, n: u32, coin: f32) u32 {
 
 }
 
+fn gpt2_zero_grad(model: *GPT2) void {
+    if (model.gradients_memory.len != 0) {
+        @memset(model.gradients_memory, 0);
+    }
+    if (model.gradients_activations_memory.len != 0) {
+        @memset(model.grads_acts_memory, 0);
+    }
+}
+
 pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, targets: []u32, B: u32, T: u32) !void {
     // @TODO: handle eventual null
     if (model.params_memory.len == 0) {
@@ -249,6 +261,8 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
         return ModelError.ModelNotInitialized;
     }
 
+    std.debug.print("gpt2_forward\n", .{});
+
     // convenience parameters
     const V = model.config.vocab_size;
     const L = model.config.n_layer;
@@ -256,6 +270,7 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     const C = model.config.n_channels;
 
     if (model.activations_memory.len == 0) {
+        model.batch_size = B;
         model.seq_len = T;
         model.activation_sizes[0] = B * T * C;
         model.activation_sizes[1] = L * B * T * C;
@@ -280,26 +295,74 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
         model.activation_sizes[20] = B * T * V;
         model.activation_sizes[21] = B * T * V;
         model.activation_sizes[22] = B * T;
-
+        // Lets compute the number of activations. Mostly for debugging reasons.
         var num_activations: u32 = 0;
-
-        for (0..NUM_ACTIVATION_TENSORS) |i| {
-            num_activations += @intCast(model.activation_sizes[i]);
+        for (model.activation_sizes) |size| {
+            num_activations += @as(u32, @intCast(size));
         }
-        std.debug.print("num_activations: {}", .{num_activations});
         model.num_activations = num_activations;
         model.activations_memory = try allocator.alloc(f32, num_activations);
+        var iter: u32 = 0;
+        model.activations.encoded = model.activations_memory[iter .. iter + model.activation_sizes[0]];
+        iter += model.activation_sizes[0];
+        model.activations.ln1 = model.activations_memory[iter .. iter + model.activation_sizes[1]];
+        iter += model.activation_sizes[1];
+        model.activations.ln1_mean = model.activations_memory[iter .. iter + model.activation_sizes[2]];
+        iter += model.activation_sizes[2];
+        model.activations.ln1_rstd = model.activations_memory[iter .. iter + model.activation_sizes[3]];
+        iter += model.activation_sizes[3];
+        model.activations.qkv = model.activations_memory[iter .. iter + model.activation_sizes[4]];
+        iter += model.activation_sizes[4];
+        model.activations.atty = model.activations_memory[iter .. iter + model.activation_sizes[5]];
+        iter += model.activation_sizes[5];
+        model.activations.preatt = model.activations_memory[iter .. iter + model.activation_sizes[6]];
+        iter += model.activation_sizes[6];
+        model.activations.att = model.activations_memory[iter .. iter + model.activation_sizes[7]];
+        iter += model.activation_sizes[7];
+        model.activations.attproj = model.activations_memory[iter .. iter + model.activation_sizes[8]];
+        iter += model.activation_sizes[8];
+        model.activations.residual2 = model.activations_memory[iter .. iter + model.activation_sizes[9]];
+        iter += model.activation_sizes[9];
+        model.activations.ln2 = model.activations_memory[iter .. iter + model.activation_sizes[10]];
+        iter += model.activation_sizes[10];
+        model.activations.ln2_mean = model.activations_memory[iter .. iter + model.activation_sizes[11]];
+        iter += model.activation_sizes[11];
+        model.activations.ln2_rstd = model.activations_memory[iter .. iter + model.activation_sizes[12]];
+        iter += model.activation_sizes[12];
+        model.activations.fch = model.activations_memory[iter .. iter + model.activation_sizes[13]];
+        iter += model.activation_sizes[13];
+        model.activations.fch_gelu = model.activations_memory[iter .. iter + model.activation_sizes[14]];
+        iter += model.activation_sizes[14];
+        model.activations.fcproj = model.activations_memory[iter .. iter + model.activation_sizes[15]];
+        iter += model.activation_sizes[15];
+        model.activations.residual3 = model.activations_memory[iter .. iter + model.activation_sizes[16]];
+        iter += model.activation_sizes[16];
+        model.activations.lnf = model.activations_memory[iter .. iter + model.activation_sizes[17]];
+        iter += model.activation_sizes[17];
+        model.activations.lnf_mean = model.activations_memory[iter .. iter + model.activation_sizes[18]];
+        iter += model.activation_sizes[18];
+        model.activations.lnf_rstd = model.activations_memory[iter .. iter + model.activation_sizes[19]];
+        iter += model.activation_sizes[19];
+        model.activations.logits = model.activations_memory[iter .. iter + model.activation_sizes[20]];
+        iter += model.activation_sizes[20];
+        model.activations.probs = model.activations_memory[iter .. iter + model.activation_sizes[21]];
+        iter += model.activation_sizes[21];
+        model.activations.losses = model.activations_memory[iter .. iter + model.activation_sizes[22]];
+        iter += model.activation_sizes[22];
+
         model.inputs = try allocator.alloc(u32, B * T);
         model.targets = try allocator.alloc(u32, B * T);
+
+        std.debug.print("num_activations: {}\n", .{model.num_activations});
     } else {
-        if (B > model.batch_size or T > model.seq_len) {
-            std.debug.print("Error: batch size or sequence length is inadequately large\n", .{});
-            std.debug.print("Model: B={} T={}, Desired: B={} T={}\n", .{ model.batch_size, model.seq_len, B, T });
-            return ModelError.BatchSizeTooLarge;
+        if ((B > model.batch_size) or (T != model.seq_len)) {
+            std.debug.print("Batch size or sequence length mismatch\n", .{});
+            return;
         }
     }
 
     @memset(model.activations_memory, 0);
+
     if (model.inputs.len > inputs.len) {
         @memcpy(model.inputs, inputs);
     }
@@ -322,6 +385,7 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     // const acts: ActivationTensors = model.activations; // ???
     var residual: []f32 = undefined;
     for (0..L) |l| {
+        std.debug.print("in 0..L\n", .{});
         residual = if (1 == 0) model.activations.encoded else model.activations.residual3[(l - 1) * B * T * C ..];
 
         // weights for this layer
@@ -388,6 +452,63 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     // }
 }
 
+// fn mallocAndPointActivations(allocator: std.mem.Allocator, acts: *ActivationTensors, act_sizes: [NUM_ACTIVATION_TENSORS]usize, acts_memory: *[]f32) !void {
+//     var total_size: usize = 0;
+//     for (act_sizes) |size| {
+//         total_size += size;
+//     }
+//
+//     acts_memory.* = try allocator.alloc(f32, total_size);
+//     var memory = acts_memory.*;
+//
+//     var offset: usize = 0;
+//     acts.encoded = memory[offset .. offset + act_sizes[0]];
+//     offset += act_sizes[0];
+//     acts.ln1 = memory[offset .. offset + act_sizes[1]];
+//     offset += act_sizes[1];
+//     acts.ln1_mean = memory[offset .. offset + act_sizes[2]];
+//     offset += act_sizes[2];
+//     acts.ln1_rstd = memory[offset .. offset + act_sizes[3]];
+//     offset += act_sizes[3];
+//     acts.qkv = memory[offset .. offset + act_sizes[4]];
+//     offset += act_sizes[4];
+//     acts.atty = memory[offset .. offset + act_sizes[5]];
+//     offset += act_sizes[5];
+//     acts.preatt = memory[offset .. offset + act_sizes[6]];
+//     offset += act_sizes[6];
+//     acts.att = memory[offset .. offset + act_sizes[7]];
+//     offset += act_sizes[7];
+//     acts.attproj = memory[offset .. offset + act_sizes[8]];
+//     offset += act_sizes[8];
+//     acts.residual2 = memory[offset .. offset + act_sizes[9]];
+//     offset += act_sizes[9];
+//     acts.ln2 = memory[offset .. offset + act_sizes[10]];
+//     offset += act_sizes[10];
+//     acts.ln2_mean = memory[offset .. offset + act_sizes[11]];
+//     offset += act_sizes[11];
+//     acts.ln2_rstd = memory[offset .. offset + act_sizes[12]];
+//     offset += act_sizes[12];
+//     acts.fch = memory[offset .. offset + act_sizes[13]];
+//     offset += act_sizes[13];
+//     acts.fch_gelu = memory[offset .. offset + act_sizes[14]];
+//     offset += act_sizes[14];
+//     acts.fcproj = memory[offset .. offset + act_sizes[15]];
+//     offset += act_sizes[15];
+//     acts.residual3 = memory[offset .. offset + act_sizes[16]];
+//     offset += act_sizes[16];
+//     acts.lnf = memory[offset .. offset + act_sizes[17]];
+//     offset += act_sizes[17];
+//     acts.lnf_mean = memory[offset .. offset + act_sizes[18]];
+//     offset += act_sizes[18];
+//     acts.lnf_rstd = memory[offset .. offset + act_sizes[19]];
+//     offset += act_sizes[19];
+//     acts.logits = memory[offset .. offset + act_sizes[20]];
+//     offset += act_sizes[20];
+//     acts.probs = memory[offset .. offset + act_sizes[21]];
+//     offset += act_sizes[21];
+//     acts.losses = memory[offset .. offset + act_sizes[22]];
+// }
+
 // @TODO: vectorized version fn encoder_forward_vec(comptime...)
 fn layer_norm_forward(out: []f32, mean: []f32, rstd: []f32, inp: []f32, weight: []f32, bias: []f32, B: u32, T: u32, C: u32) void {
     const eps = 1e-5;
@@ -420,6 +541,7 @@ fn layer_norm_forward(out: []f32, mean: []f32, rstd: []f32, inp: []f32, weight: 
 
 // @TODO: rawdogged straight from Karpathy -- zig tricks?
 fn encoder_forward(out: []f32, inp: []u32, wte: []f32, wpe: []f32, B: u32, T: u32, C: u32) void {
+    std.debug.print("encoder_forward\n", .{});
     for (0..B) |b| {
         for (0..T) |t| {
             // seek to the output position in out[b,t,:]
@@ -586,6 +708,7 @@ fn build_tokenizer_from_vocab(filepath: []const u8, tokenizer: *Tokenizer) !void
 fn read_n_from_checkpoint_file(filepath: []const u8, N: usize, comptime T: type, offset: usize) !std.ArrayList(T) {
     var file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_only });
     defer file.close();
+    std.debug.print("file filehandle from read_n: {}", .{file});
 
     const file_size = try file.getEndPos();
     std.debug.print("{}, {}, {} \n", .{ file_size, N, @sizeOf(T) });
@@ -608,17 +731,18 @@ fn dataloader_init(allocator: std.mem.Allocator, loader: *DataLoader, filepath: 
     loader.B = B;
     loader.T = T;
 
-    var file = try std.fs.cwd().openFile(filepath, .{ .mode = .read_only });
-    defer file.close();
+    loader.tokens_file = std.fs.cwd().openFile(filepath, .{ .mode = .read_only }) catch {
+        return FileOpenError.FileTooSmall;
+    };
 
-    const file_size = try file.getEndPos();
+    const file_size = try loader.tokens_file.getEndPos();
     std.debug.print("{} \n", .{file_size});
     if (file_size == 0) {
         return error.FileEmpty;
     }
     loader.file_size = file_size;
     loader.current_position = 0;
-    loader.batch = try allocator.alloc(u32, (B * T + 1) * @sizeOf(u32));
+    loader.batch = try allocator.alloc(u32, (B * T + 1));
     loader.inputs = loader.batch;
     loader.targets = loader.batch[1..];
     loader.num_batches = file_size / (B * T * @sizeOf(u32));
@@ -629,22 +753,29 @@ fn data_loader_reset(loader: *DataLoader) void {
 }
 
 fn data_loader_next_batch(loader: *DataLoader) !void {
-    std.debug.print("File handle: {}\n", .{loader.tokens_file});
+    std.debug.print("File handle: {any}\n", .{loader.tokens_file});
     std.debug.print("File size: {} bytes\n", .{loader.file_size});
-    std.debug.print("Current position: {}\n", .{loader.current_position});
-    std.debug.print("Next batch size: {} bytes\n", .{(loader.B * loader.T + 1) * @sizeOf(u32)});
-    if (loader.current_position + (loader.B * loader.T + 1) * @sizeOf(u32) >= loader.file_size) {
-        std.debug.print("test in if", .{});
+    std.debug.print("Next batch size: {} bytes\n", .{((loader.B * loader.T + 1) * @sizeOf(u32))});
+    std.debug.print("Batch, token len: {}, {}\n", .{ loader.B, loader.T });
+
+    const B: u32 = loader.B;
+    const T: u32 = loader.T;
+
+    if ((loader.current_position + (B * T + 1) * @sizeOf(u32)) > loader.file_size) {
         loader.current_position = 0;
     }
-    const result = loader.tokens_file.seekTo(loader.current_position);
-    if (result) |_| {
-        // Successfully seeked to position
-        std.debug.print(" seeking to position:\n", .{});
-    } else |err| {
-        std.debug.print("Error seeking to position: {}\n", .{err});
+
+    std.debug.print("Current position: {}\n", .{loader.current_position});
+
+    try loader.tokens_file.seekTo(loader.current_position);
+    const t = B * T + 1;
+
+    for (0..t) |i| {
+        std.debug.print("reading item {}/{}\n", .{ i + 1, t });
+        loader.batch[i] = try loader.tokens_file.reader().readInt(u32, builtin.cpu.arch.endian());
     }
-    loader.current_position += loader.B * loader.T * @sizeOf(u32);
+
+    loader.current_position += (B * T + 1) * @sizeOf(u32);
 }
 
 // fn load_embeddings(filepath: []const u8, vocab_size: usize, embedding_dim: usize) []f32 {
