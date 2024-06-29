@@ -1,8 +1,10 @@
 const std = @import("std");
+const mem = std.mem;
 const builtin = @import("builtin");
 const posix = std.posix;
 
 const NUM_ACTIVATION_TENSORS = 23;
+const NUM_PARAMETER_TENSORS = 16;
 
 const FileOpenError = error{
     InvalidHeader,
@@ -52,14 +54,8 @@ const GPT2 = struct {
     mean_loss: f32 = -1.0, // TODO ?
 };
 
-//
-// const GPT = struct {
-//     config: GPT2Config,
-//     // weights: ParameterTensors,
-// };
-//
-// // TODO: list all all acronyms here instead
-// // link to multiheaded attention, wte, wpe, layer norm, attention core concepts
+// TODO: list all all acronyms here instead
+// link to multiheaded attention, wte, wpe, layer norm, attention core concepts
 const ParameterTensors = struct {
     encoded: []f32,
     word_token_embeddings: []f32, // shape V, C where V is vocab size, C is embedding dims -- each word in the vocab is mapped to a vector of size C
@@ -104,6 +100,7 @@ const ActivationTensors = struct {
     probs: []f32, // (B, T, V)
     losses: []f32, // (B, T)
 };
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -115,117 +112,257 @@ pub fn main() !void {
         return;
     };
 
-    // TODO: write-up on why 4 and 64
-    var train_loader: DataLoader = undefined;
-    const B = 4;
-    const T = 64; // TODO: store in struct init directly?
-    try dataloader_init(allocator, &train_loader, "data/tiny_shakespeare_train.bin", B, T);
-    std.debug.print("train dataset num_batches: {}\n", .{train_loader.num_batches});
+    const C = model.config.n_channels;
+    const V = model.config.vocab_size;
+    const max_T = model.config.max_seq_len;
+    const L = model.config.n_layer;
 
-    std.debug.print("train_loader file: {}", .{train_loader.tokens_file});
-    var val_loader: DataLoader = undefined;
-    try dataloader_init(allocator, &val_loader, "data/tiny_shakespeare_val.bin", B, T);
-    std.debug.print("val dataset num_batches: {}\n", .{val_loader.num_batches});
+    // @TODO: load debug file
+    const state_file = try std.fs.cwd().openFile("gpt2_124M_debug_state.bin", .{});
+    defer state_file.close();
 
-    const val_num_batches = 10;
-    // const rng_state = 1337;
-    const gen_max_length = 64;
-    var gen_tokens: [gen_max_length]u32 = undefined;
+    var state_header: [256]i32 = undefined;
+    _ = try state_file.readAll(mem.asBytes(&state_header));
 
-    const state = 1337;
-    var prng = std.rand.DefaultPrng.init(state);
-    const rand = prng.random();
-
-    for (0..40) |step| {
-        if (step % 10 == 0) {
-            var val_loss: f32 = 0.0;
-            data_loader_reset(&val_loader);
-            std.debug.print("val_loader: {}", .{val_loader.file_size});
-            for (0..val_num_batches) |_| {
-                try data_loader_next_batch(&val_loader);
-                try gpt2_forward(allocator, &model, val_loader.inputs, val_loader.targets, B, T);
-                val_loss += model.mean_loss;
-            }
-            val_loss /= val_num_batches;
-            std.debug.print("Val loss: {}\n", .{val_loss});
-        }
-        if (step > 0 and step % 20 == 0) {
-            gen_tokens[0] = 50256;
-
-            for (1..gen_max_length) |t| {
-                const no_targs: []u32 = undefined; // @todo maybe make targets ? in gpt2_forward and switch on null
-                try gpt2_forward(allocator, &model, &gen_tokens, no_targs, 1, @intCast(t));
-                const probs = model.activations.probs[(t - 1) * model.config.vocab_size ..];
-                const coin = rand.float(f32);
-                const next_token = sample_mult(probs, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-            }
-            std.debug.print("generated: ", .{});
-            for (0..gen_max_length) |t| {
-                std.debug.print("{} ", .{gen_tokens[t]});
-            }
-            std.debug.print("\n", .{});
-        }
-        try data_loader_next_batch(&train_loader);
-        try gpt2_forward(allocator, &model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
-        // gpt2_backward(&model);
-        // gpt2_update(&model, 1e-4, 0.9, 0.999, 1e-8, 0.0, step + 1);
+    if (state_header[0] != 20240327) {
+        return error.BadMagicStateFile;
     }
 
-    // some memory for generating samples from the model
-    // unsigned long long rng_state = 1337;
-    // const int gen_max_length = 64;
-    // int gen_tokens[gen_max_length];
+    if (state_header[1] != 1) {
+        return error.BadVersionStateFile;
+    }
+
+    const B = state_header[2]; // batch size, e.g. 4
+    const T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
+
+    std.debug.print("[State]\n", .{});
+    std.debug.print("batch_size: {}\n", .{B});
+    std.debug.print("seq_len: {}\n", .{T});
+
+    var expected_grads: ParameterTensors = undefined;
+    const expected_grads_memory = malloc_and_point_parameters(allocator, &expected_grads, model.param_sizes);
+    defer allocator.free(expected_grads_memory);
+
+    // Assuming mallocAndPointParameters is implemented elsewhere
+    try malloc_and_point_parameters(allocator, &expected_grads, model.param_sizes, expected_grads_memory);
+
+    // Inputs and expected outputs, only used for error checking
+    const x = try allocator.alloc(i32, B * T);
+    defer allocator.free(x);
+
+    const y = try allocator.alloc(i32, B * T);
+    defer allocator.free(y);
+
+    const expected_logits = try allocator.alloc(f32, B * T * V);
+    defer allocator.free(expected_logits);
+
+    const expected_loss = try allocator.alloc(f32, 1);
+    defer allocator.free(expected_loss);
+
+    // Read reference information
+    _ = try state_file.readAll(mem.sliceAsBytes(x));
+    _ = try state_file.readAll(mem.sliceAsBytes(y));
+    _ = try state_file.readAll(mem.sliceAsBytes(expected_logits));
+    _ = try state_file.readAll(mem.sliceAsBytes(expected_loss));
+    _ = try state_file.readAll(mem.sliceAsBytes(expected_grads_memory));
+
+    // @TODO: load expected grads
+    // const expected_grads_memory = malloc_and_point_parameters(allocator, &expected_grads, model.param_sizes);
+
+    var all_ok = true;
+    const losses = [10]f32;
+
+    for (0..10) |step| {
+        gpt2_forward(allocator, &model, model.inputs, model.targets, 1, 3) catch |err| {
+            std.debug.print("Error in forward pass: {}\n", .{err});
+        };
+        gpt2_zero_grad(&model);
+        gpt2_backward(allocator, &model) catch |err| {
+            std.debug.print("Error in backward pass: {}\n", .{err});
+        };
+
+        if (step == 0) {
+            const logits_ok = 1;
+            for (0..(B * T * V)) |i| {
+                if (i < 3) {
+                    // @TODO: expected_logits[i
+                    std.debug.print("logits[{}]: {}\n", .{ i, model.activations.logits[i] });
+                }
+                if (@abs(model.activations.logits[i] - expected_logits[i]) > 1e-2) {
+                    std.debug.print("logits[{}] mismatch: expected: {}, got: {}\n", .{ i, expected_logits[i], model.activations.logits[i] });
+                    logits_ok = false;
+                    break;
+                }
+            }
+            all_ok = all_ok and logits_ok;
+
+            if (@abs(model.mean_loss - expected_loss) >= 1e-2) {
+                std.debug.print("mean loss mismatch: expected: {}, got: {}\n", .{ expected_loss, model.mean_loss });
+                all_ok = false;
+            } else {
+                std.debug.print("loss is OK: {}, {}\n", .{ model.mean_loss, expected_loss });
+            }
+
+            // @TODO check gradients like llm.c
+            const grads_ok: [16]i32 = undefined;
+            const grads = model.gradients;
+            grads_ok[0] = checkTensor(grads.word_token_embeddings, expected_grads.word_token_embeddings, V * C, "word_token_embeddings");
+            grads_ok[1] = checkTensor(grads.word_position_embeddings, expected_grads.word_position_embeddings, max_T * C, "word_position_embeddings");
+            grads_ok[2] = checkTensor(grads.layer_norm_weights_layer_1, expected_grads.layer_norm_weights_layer_1, L * C, "layer_norm_weights_layer_1");
+            grads_ok[3] = checkTensor(grads.layer_norm_biases_layer_1, expected_grads.layer_norm_biases_layer_1, L * C, "layer_norm_biases_layer_1");
+            grads_ok[4] = checkTensor(grads.qkvw, expected_grads.qkvw, L * 3 * C * C, "qkvw");
+            grads_ok[5] = checkTensor(grads.qkvb, expected_grads.qkvb, L * 3 * C, "qkvb");
+            grads_ok[6] = checkTensor(grads.attention_projection_weights, expected_grads.attention_projection_weights, L * C * C, "attention_projection_weights");
+            grads_ok[7] = checkTensor(grads.attention_projection_biases, expected_grads.attention_projection_biases, L * C, "attention_projection_biases");
+            grads_ok[8] = checkTensor(grads.layer_norm_weights_layer_2, expected_grads.layer_norm_weights_layer_2, L * C, "layer_norm_weights_layer_2");
+            grads_ok[9] = checkTensor(grads.layer_norm_biases_layer_2, expected_grads.layer_norm_biases_layer_2, L * C, "layer_norm_biases_layer_2");
+            grads_ok[10] = checkTensor(grads.feed_forward_weights, expected_grads.feed_forward_weights, L * 4 * C * C, "feed_forward_weights");
+            grads_ok[11] = checkTensor(grads.feed_forward_biases, expected_grads.feed_forward_biases, L * 4 * C, "feed_forward_biases");
+            grads_ok[12] = checkTensor(grads.feed_forward_projection_weights, expected_grads.feed_forward_projection_weights, L * C * 4 * C, "feed_forward_projection_weights");
+            grads_ok[13] = checkTensor(grads.feed_forward_project_biases, expected_grads.feed, L * C, "feed_forward_project_biases");
+            grads_ok[14] = checkTensor(grads.final_layer_norm_weights, expected_grads.final_layer_norm_weights, C, "final_layer_norm_weights");
+            grads_ok[15] = checkTensor(grads.final_layer_norm_biases, expected_grads.final_layer_norm_biases, "final_layer_norm_biases");
+            for (0..16) |i| {
+                all_ok = all_ok and grads_ok[i];
+            }
+        }
+        gpt2_update(&model, 1e-4, 0.9, 0.999, 1e-8, 0.01, step + 1) catch |err| {
+            std.debug.print("Error in update: {}\n", .{err});
+        };
+        std.debug.print("step {}: loss {}", .{ step, model.mean_loss });
+        losses[step] = model.mean_loss;
+    }
+
+    // compare losses
+    const expected_losses = [_]f32{
+        5.270007133483887,
+        4.059706687927246,
+        3.3751230239868164,
+        2.8007826805114746,
+        2.315382242202759,
+        1.8490285873413086,
+        1.3946564197540283,
+        0.9991465210914612,
+        0.6240804195404053,
+        0.37651097774505615,
+    };
+
+    for (0..10) |i| {
+        if (@abs(losses[i] - expected_losses[i]) >= 1e-2) {
+            std.debug.print("loss[{}] mismatch: expected: {}, got: {}\n", .{ i, expected_losses[i], losses[i] });
+            all_ok = false;
+        } else {
+            std.debug.print("loss[{}] is OK: {}, {}\n", .{ i, losses[i], expected_losses[i] });
+        }
+    }
+
+    std.debug.print("overall ok: {}", .{all_ok});
+}
+
+fn gpt2_update(model: *GPT2, learning_rate: f32, beta1: f32, beta2: f32, epsilon: f32, weight_decay: f32, step: u32) !void {
+    // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+    if (model.m.len == 0) {
+        model.m = try model.allocator.alloc(f32, model.num_parameters);
+        model.v = try model.allocator.alloc(f32, model.num_parameters);
+    }
+
+    for (0..model.num_parameters) |i| {
+        const param = model.params_memory[i];
+        const grad = model.gradients_memory[i];
+        const m = beta1 * model.m[i] + (1.0 - beta1) * grad;
+        const v = beta2 * model.v[i] + (1.0 - beta2) * grad * grad;
+        const m_hat = m / (1.0 - std.math.pow(f32, beta1, step));
+        const v_hat = v / (1.0 - std.math.pow(f32, beta2, step));
+
+        model.m_memory[i] = m;
+        model.v_memory[i] = v;
+        model.params_memory[i] = param - learning_rate * (m_hat / (std.math.sqrt(v_hat) + epsilon) + weight_decay * param);
+    }
+}
+
+pub fn checkTensor(a: []const f32, b: []const f32, n: i32, label: []const u8) bool {
+    const print_upto = 5;
+    var ok = true;
+
+    std.debug.print("{s}\n", .{label});
+
+    for (0..n) |i| {
+        if (@abs(a[i] - b[i]) <= 1e-2) {
+            if (i < print_upto) {
+                std.debug.print("OK", .{});
+            }
+        } else {
+            if (i < print_upto) {
+                std.debug.print("NOT OK", .{});
+            }
+            ok = false;
+        }
+        if (i < print_upto) {
+            std.debug.print("a[{}]: {}, b[{}]: {}\n", .{ i, a[i], i, b[i] });
+        }
+    }
+
+    // Print the final result
+    if (ok) {
+        std.debug.print("TENSOR OK\n", .{});
+    } else {
+        std.debug.print("TENSOR NOT OK\n", .{});
+    }
+
+    return ok;
+}
+
+fn load_debug_state(allocator: std.mem.Allocator, model: *GPT2, V: u32) !std.fs.File {
+    const state_file = try std.fs.cwd().openFile("gpt2_124M_debug_state.bin", .{});
+
+    var state_header: [256]i32 = undefined;
+    _ = try state_file.readAll(mem.asBytes(&state_header));
+
+    if (state_header[0] != 20240327) {
+        return error.BadMagicStateFile;
+    }
+
+    if (state_header[1] != 1) {
+        return error.BadVersionStateFile;
+    }
+
+    const B = state_header[2]; // batch size, e.g. 4
+    const T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
     //
-    // // train
-    // struct timespec start, end;
-    // for (int step = 0; step <= 40; step++) {
-    //
-    //     // once in a while estimate the validation loss
-    //     if (step % 10 == 0) {
-    //         float val_loss = 0.0f;
-    //         dataloader_reset(&val_loader);
-    //         for (int i = 0; i < val_num_batches; i++) {
-    //             dataloader_next_batch(&val_loader);
-    //             gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
-    //             val_loss += model.mean_loss;
-    //         }
-    //         val_loss /= val_num_batches;
-    //         printf("val loss %f\n", val_loss);
-    //     }
-    //
-    //     // once in a while do model inference to print generated text
-    //     if (step > 0 && step % 20 == 0) {
-    //         gen_tokens[0] = GPT2_EOT; // the GPT-2 EOT token kicks off the generation
-    //         for (int t = 1; t < gen_max_length; t++) {
-    //             // note that inference is wasteful here because
-    //             // for each t, we re-compute all activations between 0 and t
-    //             // leaving this alone because you want separate code for inference anyway
-    //             // the inference here is just for sanity checking purposes
-    //             gpt2_forward(&model, gen_tokens, NULL, 1, t);
-    //             float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
-    //             float coin = random_f32(&rng_state);
-    //             int next_token = sample_mult(probs, model.config.vocab_size, coin);
-    //             gen_tokens[t] = next_token;
-    //         }
-    //         printf("generated: ");
-    //         for (int t = 0; t < gen_max_length; t++) {
-    //             printf("%d ", gen_tokens[t]);
-    //         }
-    //         printf("\n");
-    //     }
-    //
-    //     // do a training step
-    //     clock_gettime(CLOCK_MONOTONIC, &start);
-    //     dataloader_next_batch(&train_loader);
-    //     gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-    //     gpt2_zero_grad(&model);
-    //     gpt2_backward(&model);
-    //     gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-    //     clock_gettime(CLOCK_MONOTONIC, &end);
-    //     double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    //     printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+    // fn gpt2_update(
+
+    std.debug.print("[State]\n", .{});
+    std.debug.print("batch_size: {}\n", .{B});
+    std.debug.print("seq_len: {}\n", .{T});
+
+    var expected_grads: ParameterTensors = undefined;
+    const expected_grads_memory = try allocator.alloc(f32, model.num_parameters);
+    defer allocator.free(expected_grads_memory);
+
+    // Assuming mallocAndPointParameters is implemented elsewhere
+    try malloc_and_point_parameters(allocator, &expected_grads, model.param_sizes, expected_grads_memory);
+
+    // Inputs and expected outputs, only used for error checking
+    const x = try allocator.alloc(i32, B * T);
+    defer allocator.free(x);
+
+    const y = try allocator.alloc(i32, B * T);
+    defer allocator.free(y);
+
+    const expected_logits = try allocator.alloc(f32, B * T * V);
+    defer allocator.free(expected_logits);
+
+    const expected_loss = try allocator.alloc(f32, 1);
+    defer allocator.free(expected_loss);
+
+    // Read reference information
+    _ = try state_file.readAll(mem.sliceAsBytes(x));
+    _ = try state_file.readAll(mem.sliceAsBytes(y));
+    _ = try state_file.readAll(mem.sliceAsBytes(expected_logits));
+    _ = try state_file.readAll(mem.sliceAsBytes(expected_loss));
+    _ = try state_file.readAll(mem.sliceAsBytes(expected_grads_memory));
+
+    return state_file;
 }
 
 fn sample_mult(probabilities: []f32, n: u32, coin: f32) u32 {
@@ -251,6 +388,203 @@ fn gpt2_zero_grad(model: *GPT2) void {
     if (model.gradients_activations_memory.len != 0) {
         @memset(model.gradients_activations_memory, 0);
     }
+}
+
+fn gpt2_backward(allocator: std.mem.Allocator, model: *GPT2) !void {
+    if (model.mean_loss == -1.0) {
+        std.debug.print("Error: must forward with targets before applying backward\n", .{});
+    }
+
+    if (model.gradients_memory.len == 0) {
+        // model.gradients_memory = try allocator.alloc(f32, model.gradients);
+        // model.gradients_activations_memory = try allocator.alloc(f32, model.activation_sizes);
+        model.gradients_memory = malloc_and_point_parameters(allocator, &model.gradients, model.param_sizes);
+        model.gradients_activations_memory = malloc_and_point_activations(allocator, &model.gradients_activations, model.activation_sizes);
+    }
+
+    const B = model.batch_size;
+    const T = model.seq_len;
+    const V = model.config.vocab_size;
+    const L = model.config.n_layer;
+    const C = model.config.n_channels;
+    const NH = model.config.n_head;
+
+    const params = model.params;
+    const grads = model.gradients;
+    const acts = model.activations;
+    const grads_acts = model.gradients_activations;
+
+    const dloss_mean = 1.0 / (B * T);
+    for (0..B * T) |i| {
+        grads_acts.losses[i] = dloss_mean;
+    }
+
+    var dbiases: []f32 = undefined;
+    dbiases.len = 0;
+
+    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model.targets, B, T, V);
+    matmul_backward(grads_acts.lnf, grads.wte, dbiases, grads_acts.logits, acts.lnf, params.wte, B, T, C, V);
+    const residual = acts.residual3 + (L - 1) * B * T * C;
+    const dresidual = grads_acts.residual3 + (L - 1) * B * T * C;
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+
+    for (0..L - 1) |l| {
+        // @TODO: PICK UP BACK FROM HERE
+    }
+}
+
+pub fn layernorm_backward(dinp: []f32, dweight: []f32, dbias: []f32, dout: []f32, inp: []f32, inp: []f32, weight: []f32, mean: []f32, rtsd: []f32, B: u32, T: u32, C: u32) void {
+    for (0..B) |b| {
+        for (0..T) |t| {
+            const dout_bt = dout[b * T * C + t * C];
+            const inp_bt = dinp[b * T * C + t * C];
+            const dinp_bt = dinp[b * T * C + t * C];
+            const mean_bt = mean[b * T + t];
+            const rstd_bt = rtsd[b * T + t];
+
+            var dnorm_mean = 0.0;
+            var dnorm_norm_mean = 0.0;
+            for (0..C) |i| {
+                const norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                const dnorm_i = weight[i] * dout_bt[i];
+                dnorm_mean += dnorm_i;
+                dnorm_norm_mean += dnorm_i * norm_bti;
+            }
+            dnorm_mean /= C;
+            dnorm_norm_mean /= C;
+
+            for (0..C) |i| {
+                const norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                const dnorm_i = weight[i] * dout_bt[i];
+                const dnorm = dnorm_i * rstd_bt;
+                const dinp_i = dnorm - dnorm_mean - norm_bti * dnorm_rstd;
+                dinp_bt[i] += dinp_i;
+                dweight[i] += dinp_i * norm_bti;
+                dbias[i] += dnorm_i;
+                var dval = 0.0;
+                dval += dnorm_i;
+                dval -= dnorm_mean;
+                dval -= norm_bti * dnorm_norm_mean;
+                dval *= rstd_bt;
+                dinp_bt[i] += dval;
+            }
+        }
+    }
+}
+
+pub fn crossentropy_softmax_backward(
+    dlogits: []f32,
+    dlosses: []const f32,
+    probs: []const f32,
+    targets: []const i32,
+    B: usize,
+    T: usize,
+    V: usize,
+) void {
+    const BT = B * T;
+
+    for (0..BT) |bt| {
+        const base_index = bt * V;
+        const dloss = dlosses[bt];
+        const target: usize = @intCast(targets[bt]);
+
+        for (0..V) |i| {
+            const index = base_index + i;
+            const p = probs[index];
+            const indicator: f32 = if (i == target) 1.0 else 0.0;
+            dlogits[index] += (p - indicator) * dloss;
+        }
+    }
+}
+
+pub fn matmul_backward(
+    dinp: []f32,
+    dweight: []f32,
+    dbias: ?[]f32,
+    dout: []const f32,
+    inp: []const f32,
+    weight: []const f32,
+    B: usize,
+    T: usize,
+    C: usize,
+    OC: usize,
+) !void {
+    for (0..B) |b| {
+        for (0..T) |t| {
+            const dout_bt = dout[b * T * OC + t * OC];
+            const dinp_bt = dinp[b * T * C + t * C];
+            for (0..OC) |o| {
+                const wrow = weight[o * C];
+                const d = dout_bt[o];
+                for (0..C) |c| {
+                    dinp_bt[c] += d * wrow[c];
+                }
+            }
+        }
+    }
+
+    for (0..OC) |o| {
+        for (0..B) |b| {
+            for (0..T) |t| {
+                const dout_bt = dout[b * T * OC + t * OC];
+                const inp_bt = inp[b * T * C + t * C];
+                const dwrow = dweight[o * C];
+                const d = dout_bt[o];
+                if (dbias != null) {
+                    dbias[o] += d;
+                }
+                for (0..C) |c| {
+                    dwrow[c] += d * inp_bt[c];
+                }
+            }
+        }
+    }
+}
+
+fn malloc_and_point_activations(allocator: mem.Allocator, acts: *ActivationTensors, act_sizes: []const usize) ![]f32 {
+    var num_activations: usize = 0;
+    for (act_sizes[0..NUM_ACTIVATION_TENSORS]) |size| {
+        num_activations += size;
+    }
+    // Allocate all activations at once
+    const acts_memory = try allocator.alloc(f32, num_activations);
+    // Define an array of pointers to the tensor fields in ActivationTensors
+    const ptrs = [_]*?[*]f32{
+        &acts.encoded,   &acts.ln1,       &acts.ln1_mean, &acts.ln1_rstd,
+        &acts.qkv,       &acts.atty,      &acts.preatt,   &acts.att,
+        &acts.attproj,   &acts.residual2, &acts.ln2,      &acts.ln2_mean,
+        &acts.ln2_rstd,  &acts.fch,       &acts.fch_gelu, &acts.fcproj,
+        &acts.residual3, &acts.lnf,       &acts.lnf_mean, &acts.lnf_rstd,
+        &acts.logits,    &acts.probs,     &acts.losses,
+    };
+    var acts_memory_iterator: [*]f32 = acts_memory.ptr;
+    for (ptrs, act_sizes[0..NUM_ACTIVATION_TENSORS]) |ptr, size| {
+        ptr.* = acts_memory_iterator;
+        acts_memory_iterator += size;
+    }
+    return acts_memory;
+}
+
+fn malloc_and_point_parameters(allocator: mem.Allocator, params: *ParameterTensors, param_sizes: []const usize) ![]f32 {
+    var num_parameters: usize = 0;
+    for (param_sizes[0..NUM_PARAMETER_TENSORS]) |size| {
+        num_parameters += size;
+    }
+    // Allocate all parameters at once
+    const params_memory = try allocator.alloc(f32, num_parameters);
+    // Define an array of pointers to the tensor fields in ParameterTensors
+    const ptrs = [_]*?[*]f32{
+        &params.wte,     &params.wpe,     &params.ln1w,     &params.ln1b,
+        &params.qkvw,    &params.qkvb,    &params.attprojw, &params.attprojb,
+        &params.ln2w,    &params.ln2b,    &params.fcw,      &params.fcb,
+        &params.fcprojw, &params.fcprojb, &params.lnfw,     &params.lnfb,
+    };
+    var params_memory_iterator: [*]f32 = params_memory.ptr;
+    for (ptrs, param_sizes[0..NUM_PARAMETER_TENSORS]) |ptr, size| {
+        ptr.* = params_memory_iterator;
+        params_memory_iterator += size;
+    }
+    return params_memory;
 }
 
 pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, targets: []u32, B: u32, T: u32) !void {
@@ -296,7 +630,6 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
         model.activation_sizes[20] = B * T * V;
         model.activation_sizes[21] = B * T * V;
         model.activation_sizes[22] = B * T;
-        // Lets compute the number of activations. Mostly for debugging reasons.
         var num_activations: u32 = 0;
         for (model.activation_sizes) |size| {
             num_activations += @as(u32, @intCast(size));
@@ -389,7 +722,6 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     std.debug.assert(model.config.n_channels == C);
     encoder_forward(model.activations.encoded, inputs, model.params.word_token_embeddings, model.params.word_position_embeddings, B, T, C);
 
-    //////////
     // const params: ParameterTensors = model.params; // ???
     // const acts: ActivationTensors = model.activations; // ???
     var residual: []f32 = undefined;
@@ -637,6 +969,7 @@ fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
 
     std.debug.print("params_memory[1]: {}\n", .{model.params_memory[1]});
 
+    // @TOOD: llm.c artifacts
     // // read in all the parameters from file
     // model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
     // fread(model->params_memory, sizeof(float), num_parameters, model_file);
@@ -784,7 +1117,3 @@ fn data_loader_next_batch(loader: *DataLoader) !void {
 // multiheaded attention
 // FFN
 // add & norm
-
-test "simple test" {
-    try std.testing.expectEqual(1, 1);
-}
