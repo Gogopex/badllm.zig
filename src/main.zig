@@ -249,7 +249,7 @@ fn gpt2_zero_grad(model: *GPT2) void {
         @memset(model.gradients_memory, 0);
     }
     if (model.gradients_activations_memory.len != 0) {
-        @memset(model.grads_acts_memory, 0);
+        @memset(model.gradients_activations_memory, 0);
     }
 }
 
@@ -269,6 +269,7 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     const NH = model.config.n_head;
     const C = model.config.n_channels;
 
+    std.debug.print("activation memory length: {}\n", .{model.activations_memory.len});
     if (model.activations_memory.len == 0) {
         model.batch_size = B;
         model.seq_len = T;
@@ -355,17 +356,24 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
 
         std.debug.print("num_activations: {}\n", .{model.num_activations});
     } else {
+        std.debug.print("B, model.batch_size: {}, {}\n", .{ B, model.batch_size });
+        std.debug.print("T, model.seq_len: {}, {}\n", .{ T, model.seq_len });
+        std.debug.assert(B > model.batch_size);
+        std.debug.assert(T != model.seq_len);
+        std.debug.assert((B > model.batch_size) or (T != model.seq_len));
         if ((B > model.batch_size) or (T != model.seq_len)) {
             std.debug.print("Batch size or sequence length mismatch\n", .{});
             return;
         }
     }
 
-    @memset(model.activations_memory, 0);
+    std.debug.print("model.inputs.len: {}, inputs len: {}", .{ model.inputs.len, inputs.len });
 
     if (model.inputs.len > inputs.len) {
         @memcpy(model.inputs, inputs);
     }
+
+    std.debug.print("after memcpy", .{});
 
     if (targets.len != 0) {
         @memcpy(model.targets, targets);
@@ -378,6 +386,7 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     // if ((C % vec_size == 0) and (C > vec_size)) {
     //     encoder_forward_vec(vec_size, model.activations.encoded, inputs, model.params.word_token_embeddings, B, T, C);
     // }
+    std.debug.assert(model.config.n_channels == C);
     encoder_forward(model.activations.encoded, inputs, model.params.word_token_embeddings, model.params.word_position_embeddings, B, T, C);
 
     //////////
@@ -544,41 +553,23 @@ fn encoder_forward(out: []f32, inp: []u32, wte: []f32, wpe: []f32, B: u32, T: u3
     std.debug.print("encoder_forward\n", .{});
     for (0..B) |b| {
         for (0..T) |t| {
-            // seek to the output position in out[b,t,:]
             var out_bt = out[b * T * C + t * C ..];
-            // get the index of the token at inp[b, t]
-            const ix = inp[b * T + t];
-            // seek to the position in wte corresponding to the token
+            // Get the index of the token at inp[b, t]
+            const ix: u32 = inp[b * T + t];
+            // Seek to the position in wte corresponding to the token
             const wte_ix = wte[ix * C ..];
-            // seek to the position in wpe corresponding to the position
+            // Seek to the position in wpe corresponding to the position
+            std.debug.print("wpe len: {}\n", .{wpe.len});
+            std.debug.print("t, C: {}, {}\n", .{ t, C });
             const wpe_t = wpe[t * C ..];
-            // add the two vectors and store the result in out[b,t,:]
-            for (0..C) |i| {
-                out_bt[i] = wte_ix[i] + wpe_t[i];
+            std.debug.print("wpe_t.len: {}\n", .{wpe_t.len});
+
+            for (0..C) |c| {
+                out_bt[c] = wte_ix[c] + wpe_t[c];
             }
         }
     }
 }
-
-// fn matmul_forward(logits: []f32, lnf: []f32, wte: []f32, B: u32, T: u32, C: u32, V: u32) void {}
-
-// TODO: old mess to clean up
-// pub fn gelu(x: f32) f32 {
-//     return 0.5 * x * (1.0 + std.math.tan(std.math.sqrt(2.0 / std.math.pi) * (x + 0.044715 * pow(x, 3.9))));
-// }
-
-// TODO: old mess to clean up
-// fn layer_norm(x: []f32, eps: f32) []32 {
-//     const mean = std.math.mean(x);
-//     const variance = std.math.variance(x, mean);
-//     const normalized = std.heap.page_allocator.create([]f32, x.len) catch unreachable;
-//
-//     for (x, 0..) |value, i| {
-//         normalized[i] = (value - mean) / std.math.sqrt(variance + eps);
-//     }
-//
-//     return normalized;
-// }
 
 const Tokenizer = struct { vocabulary_size: u32, init: bool, data: []u8 };
 const DataLoader = struct {
@@ -607,6 +598,7 @@ fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
         .padded_vocab_size = 0,
     };
 
+    std.debug.print("config n_channels: {}\n", .{config.n_channels});
     model.config = config;
 
     // TODO: breakdown and explanation for newbies
@@ -651,16 +643,18 @@ fn build_model_from_file(filepath: []const u8, model: *GPT2) !void {
     // fclose(model_file);
     //
     // // other inits
-    // model->acts_memory = NULL;
-    // model->grads_memory = NULL;
-    // model->m_memory = NULL;
-    // model->v_memory = NULL;
-    // model->grads_acts_memory = NULL;
-    // model->inputs = NULL;
-    // model->targets = NULL;
-    // model->batch_size = 0;
-    // model->seq_len = 0;
-    // model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model.activations_memory = std.mem.zeroes([]f32);
+
+    // @memset(model.activations_memory, 0);
+    model.gradients_memory = undefined;
+    model.m_memory = undefined;
+    model.v_memory = undefined;
+    model.gradients_activations_memory = undefined;
+    model.inputs = undefined;
+    model.targets = undefined;
+    model.batch_size = 0;
+    model.seq_len = 0;
+    model.mean_loss = -1.0; // -1.0 will designate no loss
     model.config = config;
 }
 
@@ -771,7 +765,6 @@ fn data_loader_next_batch(loader: *DataLoader) !void {
     const t = B * T + 1;
 
     for (0..t) |i| {
-        std.debug.print("reading item {}/{}\n", .{ i + 1, t });
         loader.batch[i] = try loader.tokens_file.reader().readInt(u32, builtin.cpu.arch.endian());
     }
 
