@@ -19,12 +19,12 @@ const ModelError = error{
 };
 
 const GPT2Config = struct {
-    max_seq_len: u32, // Maximum sequence length eg 1024
-    vocab_size: u32, // Vocabulary size eg 50257
-    n_embed: u32, // Embedding dimension eg 768
-    n_layer: u32, // Number of layers eg 12
-    n_head: u32, // Number of attention heads eg 12
-    n_channels: u32, // Number of channels in the MLP eg 768
+    max_seq_len: u32, // maximum sequence length eg 1024
+    vocab_size: u32, // vocabulary size eg 50257
+    n_embed: u32, // embedding dimension eg 768
+    n_layer: u32, // number of layers eg 12
+    n_head: u32, // number of attention heads eg 12
+    n_channels: u32, // number of channels in the MLP eg 768
     padded_vocab_size: usize,
 };
 
@@ -38,9 +38,9 @@ const GPT2 = struct {
     activations_memory: []f32,
     num_activations: u32,
     activation_sizes: [23]u32,
-    gradients: []f32,
+    gradients: ParameterTensors,
     gradients_memory: []f32,
-    gradients_activations: []f32,
+    gradients_activations: ActivationTensors,
     gradients_activations_memory: []f32,
     // AdamW optimizer buffers
     m: []f32,
@@ -62,17 +62,18 @@ const ParameterTensors = struct {
     word_position_embeddings: []f32, // shape maxT, C -- maxT is maximum sequence length, C is embeddingdims -- adds positional info to the token embeddings
     layer_norm_weights_layer_1: []f32, // shape L, C -- L is the num of layers, C embedding dims
     layer_norm_biases_layer_1: []f32, // shape L, C -- L is the num of layers, C embedding dims
-    qkvw: f32, // shape L, 3C, C -- query key values weight projections for multiheaded attention -- L is num of layers, 3C is query/key/values concat, C is the embedding dims
-    qkvb: f32, // shape L, 3C -- query key values bias projections for multiheaded attention
-    attention_projection_weights: f32, // shape L, C, C -- weights of the concat output of the attention heads back to the embedding dimension
-    attention_projection_biases: f32, // shape L, C -- biases of the concat output of the attention heads back to the embedding dimension
-    layer_norm_weights_layer_2: f32, //
-    layer_norm_biases_layer_2: f32,
-    feed_forward_weights: f32, // shape L, 4C, C -- weights of the FFN
-    feed_forward_biases: f32, // shape L, 4C -- biases of the FFN
-    feed_forward_projection_weights: f32, // L, C, 4C -- weights for projecting the output of the FFN back to the embedding dimension
-    final_layer_norm_weights: f32, // shape C -- final weights for the final layer norm
-    final_layer_norm_biases: f32, // shape C -- final biases for the final layer norm
+    qkvw: []f32, // shape L, 3C, C -- query key values weight projections for multiheaded attention -- L is num of layers, 3C is query/key/values concat, C is the embedding dims
+    qkvb: []f32, // shape L, 3C -- query key values bias projections for multiheaded attention
+    attention_projection_weights: []f32, // shape L, C, C -- weights of the concat output of the attention heads back to the embedding dimension
+    attention_projection_biases: []f32, // shape L, C -- biases of the concat output of the attention heads back to the embedding dimension
+    layer_norm_weights_layer_2: []f32, //
+    layer_norm_biases_layer_2: []f32,
+    feed_forward_weights: []f32, // shape L, 4C, C -- weights of the FFN
+    feed_forward_biases: []f32, // shape L, 4C -- biases of the FFN
+    feed_forward_projection_weights: []f32, // L, C, 4C -- weights for projecting the output of the FFN back to the embedding dimension
+    feed_forward_projection_biases: []f32, // L, C -- biases for projecting the output of the FFN back to the embedding dimension
+    final_layer_norm_weights: []f32, // shape C -- final weights for the final layer norm
+    final_layer_norm_biases: []f32, // shape C -- final biases for the final layer norm
 };
 
 const ActivationTensors = struct {
@@ -140,13 +141,12 @@ pub fn main() !void {
     std.debug.print("seq_len: {}\n", .{T});
 
     var expected_grads: ParameterTensors = undefined;
-    const expected_grads_memory = malloc_and_point_parameters(allocator, &expected_grads, model.param_sizes);
+    const expected_grads_memory = malloc_and_point_parameters(allocator, &expected_grads, &model.params_size);
     defer allocator.free(expected_grads_memory);
 
-    // Assuming mallocAndPointParameters is implemented elsewhere
-    try malloc_and_point_parameters(allocator, &expected_grads, model.param_sizes, expected_grads_memory);
+    try malloc_and_point_parameters(allocator, &expected_grads, &model.params_size);
 
-    // Inputs and expected outputs, only used for error checking
+    // inputs and expected outputs, only used for error checking
     const x = try allocator.alloc(i32, B * T);
     defer allocator.free(x);
 
@@ -159,7 +159,7 @@ pub fn main() !void {
     const expected_loss = try allocator.alloc(f32, 1);
     defer allocator.free(expected_loss);
 
-    // Read reference information
+    // iead reference information
     _ = try state_file.readAll(mem.sliceAsBytes(x));
     _ = try state_file.readAll(mem.sliceAsBytes(y));
     _ = try state_file.readAll(mem.sliceAsBytes(expected_logits));
@@ -390,54 +390,187 @@ fn gpt2_zero_grad(model: *GPT2) void {
     }
 }
 
-fn gpt2_backward(allocator: std.mem.Allocator, model: *GPT2) !void {
+pub fn gpt2_backward(model: *GPT2) void {
+    // double check we forwarded previously, with targets
     if (model.mean_loss == -1.0) {
-        std.debug.print("Error: must forward with targets before applying backward\n", .{});
+        std.debug.print("Error: must forward with targets before backward\n", .{});
+        std.process.exit(1);
     }
 
-    if (model.gradients_memory.len == 0) {
-        // model.gradients_memory = try allocator.alloc(f32, model.gradients);
-        // model.gradients_activations_memory = try allocator.alloc(f32, model.activation_sizes);
-        model.gradients_memory = malloc_and_point_parameters(allocator, &model.gradients, model.param_sizes);
-        model.gradients_activations_memory = malloc_and_point_activations(allocator, &model.gradients_activations, model.activation_sizes);
+    // lazily allocate the memory for gradients of the weights and activations, if needed
+    if (model.grads_memory == null) {
+        model.grads_memory = malloc_and_point_parameters(&model.grads, model.param_sizes);
+        model.grads_acts_memory = malloc_and_point_activations(&model.grads_acts, model.act_sizes);
+        gpt2_zero_grad(model);
     }
 
+    // cnvenience shortcuts
     const B = model.batch_size;
     const T = model.seq_len;
     const V = model.config.vocab_size;
-    const L = model.config.n_layer;
-    const C = model.config.n_channels;
-    const NH = model.config.n_head;
+    const L = model.config.num_layers;
+    const NH = model.config.num_heads;
+    const C = model.config.channels;
 
-    const params = model.params;
-    const grads = model.gradients;
-    const acts = model.activations;
-    const grads_acts = model.gradients_activations;
+    // backward pass
+    const params = model.params; // for brevity
+    const grads = model.grads;
+    const acts = model.acts;
+    const grads_acts = model.grads_acts;
 
+    // we kick off the chain by filling in dlosses with 1.0/(B*T), to get the mean loss
     const dloss_mean = 1.0 / (B * T);
-    for (0..B * T) |i| {
-        grads_acts.losses[i] = dloss_mean;
+    for (grads_acts.losses) |*loss| {
+        loss.* = dloss_mean;
     }
 
-    var dbiases: []f32 = undefined;
-    dbiases.len = 0;
-
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model.targets, B, T, V);
-    matmul_backward(grads_acts.lnf, grads.wte, dbiases, grads_acts.logits, acts.lnf, params.wte, B, T, C, V);
-    const residual = acts.residual3 + (L - 1) * B * T * C;
-    const dresidual = grads_acts.residual3 + (L - 1) * B * T * C;
+    matmul_backward(grads_acts.layernorm_forward, grads.word_token_embeddings, null, grads_acts.logits, acts.layernorm_forward, params.word_token_embeddings, B, T, C, V);
+    const residual = acts.residual3 + (L - 1) * B * T * C; // last layer's residual
+    const dresidual = grads_acts.residual3 + (L - 1) * B * T * C; // write to last layer's residual
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
-    for (0..L - 1) |l| {
-        // @TODO: PICK UP BACK FROM HERE
+    var l: i32 = L - 1;
+    while (l >= 0) : (l -= 1) {
+        residual = if (l == 0) acts.encoded else acts.residual3 + (l - 1) * B * T * C;
+        dresidual = if (l == 0) grads_acts.encoded else grads_acts.residual3 + (l - 1) * B * T * C;
+
+        const l_ln1w = model.params.layer_norm_weights_layer_1[l * C ..];
+        const l_qkvw = model.params.qkvw[l * 3 * C * C ..];
+        const l_attprojw = model.params.attention_projection_weights[l * C * C ..];
+        const l_ln2w = model.params.layer_norm_weights_layer_2[l * C ..];
+        const l_fcw = model.params.final_layer_norm_weights[l * 4 * C * C ..];
+        const l_fcprojw = model.params.feed_forward_projection_weights[l * C * 4 * C ..];
+        // get the slices for the gradients of the weights for this layer
+        const dl_ln1w = model.gradients.ln1w[l * C ..];
+        const dl_ln1b = model.gradients.ln1b[l * C ..];
+        const dl_qkvw = model.gradients.qkvw[l * 3 * C * C ..];
+        const dl_qkvb = model.gradients.qkvb[l * 3 * C ..];
+        const dl_attprojw = model.gradients.attprojw[l * C * C ..];
+        const dl_attprojb = model.gradients.attprojb[l * C ..];
+        const dl_ln2w = model.gradients.ln2w[l * C ..];
+        const dl_ln2b = model.gradients.ln2b[l * C ..];
+        const dl_fcw = model.gradients.fcw[l * 4 * C * C ..];
+        const dl_fcb = model.gradients.fcb[l * 4 * C ..];
+        const dl_fcprojw = model.gradients.fcprojw[l * C * 4 * C ..];
+        const dl_fcprojb = model.gradients.fcprojb[l * C ..];
+        // get the slices for the activations for this layer
+        const l_ln1 = model.activations.ln1[l * B * T * C ..];
+        const l_ln1_mean = model.activations.ln1_mean[l * B * T ..];
+        const l_ln1_rstd = model.activations.ln1_rstd[l * B * T ..];
+        const l_qkv = model.activations.qkv[l * B * T * 3 * C ..];
+        const l_atty = model.activations.atty[l * B * T * C ..];
+        const l_att = model.activations.att[l * B * NH * T * T ..];
+        const l_residual2 = model.activations.residual2[l * B * T * C ..];
+        const l_ln2 = model.activations.ln2[l * B * T * C ..];
+        const l_ln2_mean = model.activations.ln2_mean[l * B * T ..];
+        const l_ln2_rstd = model.activations.ln2_rstd[l * B * T ..];
+        const l_fch = model.activations.fch[l * B * T * 4 * C ..];
+        const l_fch_gelu = model.activations.fch_gelu[l * B * T * 4 * C ..];
+        // get the slices for the gradients of the activations for this layer
+        const dl_ln1 = model.grads_acts.ln1[l * B * T * C ..];
+        const dl_qkv = model.grads_acts.qkv[l * B * T * 3 * C ..];
+        const dl_atty = model.grads_acts.atty[l * B * T * C ..];
+        const dl_preatt = model.grads_acts.preatt[l * B * NH * T * T ..];
+        const dl_att = model.grads_acts.att[l * B * NH * T * T ..];
+        const dl_attproj = model.grads_acts.attproj[l * B * T * C ..];
+        const dl_residual2 = model.grads_acts.residual2[l * B * T * C ..];
+        const dl_ln2 = model.grads_acts.ln2[l * B * T * C ..];
+        const dl_fch = model.grads_acts.fch[l * B * T * 4 * C ..];
+        const dl_fch_gelu = model.grads_acts.fch_gelu[l * B * T * 4 * C ..];
+        const dl_fcproj = model.grads_acts.fcproj[l * B * T * C ..];
+        const dl_residual3 = model.grads_acts.residual3[l * B * T * C ..];
+
+        // backprop this layer
+        residual_backward(dl_residual2, dl_fcproj, dl_residual3, B * T * C);
+        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4 * C, C);
+        gelu_backward(dl_fch, l_fch, dl_fch_gelu, B * T * 4 * C);
+        matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4 * C);
+        layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        residual_backward(dresidual, dl_attproj, dl_residual2, B * T * C);
+        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
+        attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
+        matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3 * C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+    }
+
+    encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model.inputs, B, T, C);
+}
+
+pub fn residual_backward(dinp1: []f32, dinp2: []f32, dout: []f32, N: u32) void {
+    for (0..N) |i| {
+        dinp1[i] += dout[i];
+        dinp2[i] += dout[i];
     }
 }
 
-pub fn layernorm_backward(dinp: []f32, dweight: []f32, dbias: []f32, dout: []f32, inp: []f32, inp: []f32, weight: []f32, mean: []f32, rtsd: []f32, B: u32, T: u32, C: u32) void {
+pub fn gelu_backward(dinp: []f32, inp: []f32, dout: []f32, N: u32) void {
+    const s = 2.0 / std.math.pi;
+    for (0..N) |i| {
+        const x = inp[i];
+        const cube = 0.044715 * x * x * x;
+        const tanh_arg = s * (x + cube);
+        const tanh_out = std.math.tanh(tanh_arg);
+        const coshf_out = std.math.cosh(tanh_arg);
+        const sech_out = 1.0 / (coshf_out * coshf_out);
+        const local_grad = 0.5 * (1.0 + tanh_out) + x * 0.5 * sech_out * s * (1.0 + 3.0 * 0.044715 * x * x);
+        dinp[i] += local_grad * dout[i];
+    }
+}
+
+// pub fn attention_backward(float* dinp, float* dpreatt, float* datt,
+//                        float* dout, float* inp, float* att,
+//                        int B, int T, int C, int NH) {
+pub fn attention_backward(dinp: []f32, dpreatt: []f32, datt: []f32, dout: []f32, inp: []f32, att: []f32, B: u32, T: u32, C: u32, NH: u32) void {
+    const C3 = C * 3;
+    const hs = C / NH;
+    const scale = 1.0 / std.math.sqrt(hs);
+
+    for (0..B) |b| {
+        for (0..T) |t| {
+            for (0..NH) |h| {
+                const att_bth = att[b * NH * T * T + h * T * T + t * T ..];
+                const datt_bth = datt[b * NH * T * T + h * T * T + t * T ..];
+                const dpreatt_bth = dpreatt[b * NH * T * T + h * T * T + t * T ..];
+                const dquery_t = dinp[b * T * C3 + t * C3 + h * hs ..];
+                const query_t = inp[b * T * C3 + t * C3 + h * hs ..];
+                const dout_bth = dout[b * T * C + t * C + h * hs ..];
+                for (0..t) |t2| {
+                    const value_t2 = inp[b * T * C3 + t2 * C3 + h * hs + C * 2 ..];
+                    const dvalue_t2 = dinp[b * T * C3 + t2 * C3 + h * hs + C * 2 ..];
+                    for (0..hs) |i| {
+                        datt_bth[t2] += value_t2[i] * dout_bth[i];
+                        dvalue_t2[i] += att_bth[t2] * dout_bth[i];
+                    }
+                }
+                for (0..t) |t2| {
+                    for (0..t) |t3| {
+                        const indicator = 0.0;
+                        if (t2 == t3) {
+                            indicator = 1.0;
+                        }
+                        const local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+                        dpreatt_bth[t3] += local_derivative * datt_bth[t2];
+                    }
+                }
+                for (0..t) |t2| {
+                    const key_t2 = inp[b * T * C3 + t2 * C3 + h * hs + C ..];
+                    const dkey_t2 = dinp[b * T * C3 + t2 * C3 + h * hs + C ..];
+                    for (0..hs) |i| {
+                        dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
+                        dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn layernorm_backward(dinp: []f32, dweight: []f32, dbias: []f32, dout: []f32, inp: []f32, weight: []f32, mean: []f32, rtsd: []f32, B: u32, T: u32, C: u32) void {
     for (0..B) |b| {
         for (0..T) |t| {
             const dout_bt = dout[b * T * C + t * C];
-            const inp_bt = dinp[b * T * C + t * C];
+            const inp_bt = inp[b * T * C + t * C];
             const dinp_bt = dinp[b * T * C + t * C];
             const mean_bt = mean[b * T + t];
             const rstd_bt = rtsd[b * T + t];
@@ -456,11 +589,8 @@ pub fn layernorm_backward(dinp: []f32, dweight: []f32, dbias: []f32, dout: []f32
             for (0..C) |i| {
                 const norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
                 const dnorm_i = weight[i] * dout_bt[i];
-                const dnorm = dnorm_i * rstd_bt;
-                const dinp_i = dnorm - dnorm_mean - norm_bti * dnorm_rstd;
-                dinp_bt[i] += dinp_i;
-                dweight[i] += dinp_i * norm_bti;
-                dbias[i] += dnorm_i;
+                dweight[i] += norm_bti * dout_bt[i];
+                dbias[i] += dout_bt[i];
                 var dval = 0.0;
                 dval += dnorm_i;
                 dval -= dnorm_mean;
@@ -546,9 +676,9 @@ fn malloc_and_point_activations(allocator: mem.Allocator, acts: *ActivationTenso
     for (act_sizes[0..NUM_ACTIVATION_TENSORS]) |size| {
         num_activations += size;
     }
-    // Allocate all activations at once
+    // allocate all activations at once
     const acts_memory = try allocator.alloc(f32, num_activations);
-    // Define an array of pointers to the tensor fields in ActivationTensors
+    // array of pointers to the tensor fields in ActivationTensors
     const ptrs = [_]*?[*]f32{
         &acts.encoded,   &acts.ln1,       &acts.ln1_mean, &acts.ln1_rstd,
         &acts.qkv,       &acts.atty,      &acts.preatt,   &acts.att,
@@ -570,14 +700,14 @@ fn malloc_and_point_parameters(allocator: mem.Allocator, params: *ParameterTenso
     for (param_sizes[0..NUM_PARAMETER_TENSORS]) |size| {
         num_parameters += size;
     }
-    // Allocate all parameters at once
+    // allocate all parameters at once
     const params_memory = try allocator.alloc(f32, num_parameters);
-    // Define an array of pointers to the tensor fields in ParameterTensors
+    // array of pointers to the tensor fields in ParameterTensors
     const ptrs = [_]*?[*]f32{
-        &params.wte,     &params.wpe,     &params.ln1w,     &params.ln1b,
-        &params.qkvw,    &params.qkvb,    &params.attprojw, &params.attprojb,
-        &params.ln2w,    &params.ln2b,    &params.fcw,      &params.fcb,
-        &params.fcprojw, &params.fcprojb, &params.lnfw,     &params.lnfb,
+        &params.word_token_embeddings,           &params.word_position_embeddings,       &params.layer_norm_weights_layer_1,   &params.layer_norm_biases_layer_1,
+        &params.qkvw,                            &params.qkvb,                           &params.attention_projection_weights, &params.attention_projection_biases,
+        &params.layer_norm_weights_layer_2,      &params.layer_norm_biases_layer_2,      &params.feed_forward_weights,         &params.feed_forward_biases,
+        &params.feed_forward_projection_weights, &params.feed_forward_projection_biases, &params.final_layer_norm_weights,     &params.final_layer_norm_biases,
     };
     var params_memory_iterator: [*]f32 = params_memory.ptr;
     for (ptrs, param_sizes[0..NUM_PARAMETER_TENSORS]) |ptr, size| {
@@ -758,7 +888,7 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
         // const l_fcproj = acts.fully_connected_projection[l * B * T * C];
         // const l_residual3 = acts.residual3[l * B * T * C];
 
-        layer_norm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         // matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         // attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
         // matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
@@ -771,7 +901,7 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     }
 
     residual = model.activations.residual3[(L - 1) * B * T * C ..]; // last residual is in residual3
-    layer_norm_forward(model.activations.lnf, model.activations.lnf_mean, model.activations.lnf_rstd, residual, model.params.layer_norm_weights_layer_1, model.params.layer_norm_biases_layer_1, B, T, C);
+    layernorm_forward(model.activations.lnf, model.activations.lnf_mean, model.activations.lnf_rstd, residual, model.params.layer_norm_weights_layer_1, model.params.layer_norm_biases_layer_1, B, T, C);
     // matmul_forward(acts.logits, acts.lnf, params.wte, B, T, C, V);
     //
 
@@ -793,65 +923,8 @@ pub fn gpt2_forward(allocator: std.mem.Allocator, model: *GPT2, inputs: []u32, t
     // }
 }
 
-// fn mallocAndPointActivations(allocator: std.mem.Allocator, acts: *ActivationTensors, act_sizes: [NUM_ACTIVATION_TENSORS]usize, acts_memory: *[]f32) !void {
-//     var total_size: usize = 0;
-//     for (act_sizes) |size| {
-//         total_size += size;
-//     }
-//
-//     acts_memory.* = try allocator.alloc(f32, total_size);
-//     var memory = acts_memory.*;
-//
-//     var offset: usize = 0;
-//     acts.encoded = memory[offset .. offset + act_sizes[0]];
-//     offset += act_sizes[0];
-//     acts.ln1 = memory[offset .. offset + act_sizes[1]];
-//     offset += act_sizes[1];
-//     acts.ln1_mean = memory[offset .. offset + act_sizes[2]];
-//     offset += act_sizes[2];
-//     acts.ln1_rstd = memory[offset .. offset + act_sizes[3]];
-//     offset += act_sizes[3];
-//     acts.qkv = memory[offset .. offset + act_sizes[4]];
-//     offset += act_sizes[4];
-//     acts.atty = memory[offset .. offset + act_sizes[5]];
-//     offset += act_sizes[5];
-//     acts.preatt = memory[offset .. offset + act_sizes[6]];
-//     offset += act_sizes[6];
-//     acts.att = memory[offset .. offset + act_sizes[7]];
-//     offset += act_sizes[7];
-//     acts.attproj = memory[offset .. offset + act_sizes[8]];
-//     offset += act_sizes[8];
-//     acts.residual2 = memory[offset .. offset + act_sizes[9]];
-//     offset += act_sizes[9];
-//     acts.ln2 = memory[offset .. offset + act_sizes[10]];
-//     offset += act_sizes[10];
-//     acts.ln2_mean = memory[offset .. offset + act_sizes[11]];
-//     offset += act_sizes[11];
-//     acts.ln2_rstd = memory[offset .. offset + act_sizes[12]];
-//     offset += act_sizes[12];
-//     acts.fch = memory[offset .. offset + act_sizes[13]];
-//     offset += act_sizes[13];
-//     acts.fch_gelu = memory[offset .. offset + act_sizes[14]];
-//     offset += act_sizes[14];
-//     acts.fcproj = memory[offset .. offset + act_sizes[15]];
-//     offset += act_sizes[15];
-//     acts.residual3 = memory[offset .. offset + act_sizes[16]];
-//     offset += act_sizes[16];
-//     acts.lnf = memory[offset .. offset + act_sizes[17]];
-//     offset += act_sizes[17];
-//     acts.lnf_mean = memory[offset .. offset + act_sizes[18]];
-//     offset += act_sizes[18];
-//     acts.lnf_rstd = memory[offset .. offset + act_sizes[19]];
-//     offset += act_sizes[19];
-//     acts.logits = memory[offset .. offset + act_sizes[20]];
-//     offset += act_sizes[20];
-//     acts.probs = memory[offset .. offset + act_sizes[21]];
-//     offset += act_sizes[21];
-//     acts.losses = memory[offset .. offset + act_sizes[22]];
-// }
-
 // @TODO: vectorized version fn encoder_forward_vec(comptime...)
-fn layer_norm_forward(out: []f32, mean: []f32, rstd: []f32, inp: []f32, weight: []f32, bias: []f32, B: u32, T: u32, C: u32) void {
+fn layernorm_forward(out: []f32, mean: []f32, rstd: []f32, inp: []f32, weight: []f32, bias: []f32, B: u32, T: u32, C: u32) void {
     const eps = 1e-5;
     for (0..B) |b| {
         for (0..T) |t| {
@@ -898,6 +971,22 @@ fn encoder_forward(out: []f32, inp: []u32, wte: []f32, wpe: []f32, B: u32, T: u3
 
             for (0..C) |c| {
                 out_bt[c] = wte_ix[c] + wpe_t[c];
+            }
+        }
+    }
+}
+
+fn encoder_backward(dwte: []f32, dwpe: []f32, dout: []f32, inp: []u32, B: u32, T: u32, C: u32) void {
+    for (0..B) |b| {
+        for (0..T) |t| {
+            const dout_bt = dout[b * T * C + t * C ..];
+            const ix = inp[b * T + t];
+            const dwte_ix = dwte[ix * C ..];
+            const dwpe_t = dwpe[t * C ..];
+            for (0..C) |i| {
+                const d = dout_bt[i];
+                dwte_ix[i] += d;
+                dwpe_t[i] += d;
             }
         }
     }
@@ -1111,9 +1200,3 @@ fn data_loader_next_batch(loader: *DataLoader) !void {
 // fn load_positional_encodings(filepath: []const u8, seq_len: usize, embedding_dim: usize) []f32 {
 //     return load_weights(filepath, seq_len * embedding_dim);
 // }
-
-// TODO: design basic forward pass implementation
-// load weights and embeddings
-// multiheaded attention
-// FFN
-// add & norm
